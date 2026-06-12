@@ -1,0 +1,35 @@
+# env / secrets — never commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# database files
+backend/data/
+*.db
+*.sqlite
+
+# node / next
+node_modules/
+.next/
+out/
+frontend/.env.local
+npm-debug.log*
+.turbo/
+
+# os / editor / local tooling
+.DS_Store
+.idea/
+.vscode/
+.claude/
+*.log
