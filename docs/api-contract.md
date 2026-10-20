@@ -205,6 +205,9 @@ Body: `{ "exit_price": 0.8 }`。缺省时读取实时盘口，把剩余份额逐
 
 执行一轮持仓监控（同步返回）：已按官方结算的市场平仓入账（A25），其余 OPEN 仓位各写一条影子观察（A27）。
 不会因其他任何原因平仓或减仓。也可通过 `POSITION_MONITOR_INTERVAL_MINUTES` 定时运行或 `scripts/run_monitor.py`。
+`settled`、`observations`、`cohorts_backfilled` 只统计本轮成功提交的记录；单个市场失败时回滚该市场，
+在 `errors` 中报告并继续处理其他市场。若仓位在监控期间已被手动全部平仓，本轮不生成结算成交或结算观察，
+也不计入 `settled`；若只被部分平仓，则仅结算剩余份额。
 
 ```json
 { "started_at": "dt", "finished_at": "dt", "open_trades": 3, "observations": 3,
@@ -214,6 +217,8 @@ Body: `{ "exit_price": 0.8 }`。缺省时读取实时盘口，把剩余份额逐
 ### 10d. GET /api/paper-trades/{id}/observations
 
 Query：`limit`（默认 200）。返回入场跟随名单与观察记录（新到旧）：
+`market_status=RESOLVED` 的观察中，`liquidation_value` 为本次结算成交的实际净收入，
+`liquidation_return` 为整笔仓位全部退出收入（包含此前部分平仓及费用）相对入场 `notional` 的收益率。
 
 ```json
 { "paper_trade_id": "s",

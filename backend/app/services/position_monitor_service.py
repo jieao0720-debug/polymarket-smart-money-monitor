@@ -116,23 +116,39 @@ class PositionMonitorService:
         result = MonitorRunResult(started_at=now)
         async with self.session_factory() as session:
             rows = (await session.execute(
-                select(PaperTrade, Market).join(Market, PaperTrade.market_id == Market.id)
-                .where(PaperTrade.status == "OPEN"))).all()
-            result.open_trades = len(rows)
-            by_market: dict[int, tuple[Market, list[PaperTrade]]] = {}
-            for trade, market in rows:
-                by_market.setdefault(market.id, (market, []))[1].append(trade)
+                select(PaperTrade.id, Market.id, Market.polymarket_market_id)
+                .join(Market, PaperTrade.market_id == Market.id)
+                .where(PaperTrade.status == "OPEN").order_by(PaperTrade.id))).all()
+        result.open_trades = len(rows)
+        # Keep scalar identifiers across transactions. Rollback expires ORM objects;
+        # accessing those while logging/processing the next market can trigger async IO.
+        by_market: dict[tuple[int, str], list[int]] = {}
+        for trade_id, market_id, public_id in rows:
+            by_market.setdefault((market_id, public_id), []).append(trade_id)
 
-            for market_row, trades in by_market.values():
+        for (market_id, public_id), trade_ids in by_market.items():
+            # A failure must neither poison the next market's session nor report counts
+            # for fills/observations that were rolled back.
+            market_result = MonitorRunResult(started_at=now)
+            async with self.session_factory() as session:
                 try:
-                    await self._process_market(session, market_row, trades, now, result)
+                    market_row = await session.get(Market, market_id)
+                    if market_row is None:
+                        continue
+                    trades = (await session.execute(select(PaperTrade).where(
+                        PaperTrade.id.in_(trade_ids), PaperTrade.status == "OPEN")
+                        .order_by(PaperTrade.id))).scalars().all()
+                    await self._process_market(session, market_row, list(trades), now,
+                                               market_result)
                     await session.commit()
                 except Exception as exc:  # keep monitoring the other markets
                     await session.rollback()
-                    logger.exception("position monitor failed for market %s",
-                                     market_row.polymarket_market_id)
-                    result.errors.append(
-                        f"{market_row.polymarket_market_id}: {type(exc).__name__}")
+                    logger.exception("position monitor failed for market %s", public_id)
+                    result.errors.append(f"{public_id}: {type(exc).__name__}")
+                else:
+                    result.settled += market_result.settled
+                    result.observations += market_result.observations
+                    result.cohorts_backfilled += market_result.cohorts_backfilled
         result.finished_at = _utcnow()
         return result
 
@@ -150,16 +166,16 @@ class PositionMonitorService:
             for trade in trades:
                 payout = resolution.payout(trade.direction)
                 assert payout is not None
-                held = trade.open_shares
-                realized = _realized_proceeds(trade)
-                await self.paper_trades.settle(session, trade, payout, settled_at)
+                fill = await self.paper_trades.settle(session, trade, payout, settled_at)
+                if fill is None:  # manually closed while we fetched the market
+                    continue
                 result.settled += 1
                 session.add(PositionObservation(
                     paper_trade_id=trade.id, observed_at=now, market_status=MARKET_RESOLVED,
-                    best_bid=None, best_ask=None, liquidation_price=payout,
-                    liquidation_value=round(held * payout, 4),
+                    best_bid=None, best_ask=None, liquidation_price=fill.price,
+                    liquidation_value=round(fill.proceeds, 4),
                     liquidation_fill_ratio=1.0,
-                    liquidation_return=_ret(realized + held * payout, trade.notional),
+                    liquidation_return=_ret(_realized_proceeds(trade), trade.notional),
                     data_issues=market_issues or None))
                 result.observations += 1
             market_row.closed = True

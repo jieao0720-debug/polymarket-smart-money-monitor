@@ -730,3 +730,136 @@ class TestConcurrentExits:
         assert trade["status"] == "CLOSED" and trade["exit_reason"] == "RESOLVED"
         assert exited == pytest.approx(opened["shares"])
         assert fill_pnl == pytest.approx(trade["pnl"], abs=1e-3)
+
+
+# ----------------------------------------------------------------- regressions (review 38c4e26)
+
+class TestSettlementObservations:
+    @pytest.mark.parametrize("payout", [0.0, 0.5, 1.0])
+    @pytest.mark.parametrize("fee_bps", [0, 100])
+    @pytest.mark.parametrize("close_all", [False, True])
+    def test_monitor_uses_actual_settlement_after_manual_close(
+            self, file_db_bundle, monkeypatch, payout, fee_bps, close_all):
+        import asyncio
+
+        import httpx
+
+        client, container, dataset = file_db_bundle
+        run_scan_and_wait(client)
+        opened = _open_trade(client)
+        trade_id = opened["paper_trade_id"]
+        container.settings.paper_exit_fee_bps = fee_bps
+        dataset["gamma_markets"][0].update(
+            closed=True, outcomePrices=json.dumps([str(payout), str(1 - payout)]),
+            umaResolutionStatus="resolved")
+        dataset["books"]["111"] = {
+            "bids": [{"price": "0.5", "size": "1000" if close_all else "10"}],
+            "asks": []}
+        real_settle = container.paper_trades.settle
+
+        async def race():
+            entered = asyncio.Event()
+            release = asyncio.Event()
+
+            async def gated_settle(*args, **kwargs):
+                # The monitor has loaded the old position; the manual exit commits
+                # before settle can refresh it. This exercises the full HTTP flow.
+                entered.set()
+                await asyncio.wait_for(release.wait(), 5)
+                return await real_settle(*args, **kwargs)
+
+            monkeypatch.setattr(container.paper_trades, "settle", gated_settle)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=client.app),
+                                         base_url="http://test") as ac:
+                monitor = asyncio.create_task(ac.post("/api/paper-trades/monitor/run"))
+                try:
+                    await asyncio.wait_for(entered.wait(), 5)
+                    manual = await ac.post(f"/api/paper-trades/{trade_id}/close", json={})
+                finally:
+                    release.set()
+                    monitored = await asyncio.wait_for(monitor, 5)
+            assert manual.status_code == 200, manual.text
+            assert monitored.status_code == 200, monitored.text
+            return monitored.json()
+
+        result = client.portal.call(race)
+        assert result["errors"] == []
+        expected_count = 0 if close_all else 1
+        assert result["settled"] == result["observations"] == expected_count
+        trade, exited, fill_pnl = _ledger(client, trade_id)
+        details = _observations(client, trade_id)
+        assert trade["status"] == "CLOSED"
+        assert exited == pytest.approx(opened["shares"])
+        assert fill_pnl == pytest.approx(trade["pnl"], abs=1e-3)
+        if close_all:
+            assert trade["exit_reason"] == "MANUAL"
+            assert [x["reason"] for x in details["exits"]] == ["MANUAL"]
+            assert details["observations"] == []
+        else:
+            assert sorted(x["reason"] for x in details["exits"]) == ["MANUAL", "RESOLVED"]
+            settlement = next(x for x in details["exits"] if x["reason"] == "RESOLVED")
+            obs = details["observations"][0]
+            assert settlement["shares"] == pytest.approx(opened["shares"] - 10)
+            assert obs["market_status"] == "RESOLVED"
+            assert obs["liquidation_price"] == payout
+            assert obs["liquidation_value"] == pytest.approx(settlement["proceeds"], abs=1e-4)
+            proceeds = sum(x["proceeds"] for x in details["exits"])
+            assert obs["liquidation_return"] == pytest.approx(
+                proceeds / opened["notional"] - 1, abs=1e-6)
+        # A later pass does not manufacture another settlement or observation.
+        repeated = _run_monitor(client)
+        assert repeated["settled"] == repeated["observations"] == 0
+        assert _observations(client, trade_id) == details
+
+    @pytest.mark.parametrize("resolved", [False, True])
+    def test_failed_market_rolls_back_counts_and_continues(
+            self, file_db_bundle, monkeypatch, resolved):
+        from app.core.errors import ConflictError
+        from app.models import Market
+
+        client, container, dataset = file_db_bundle
+        run_scan_and_wait(client)
+        opened = _open_trade(client)
+        dataset["gamma_markets"].append(fakes.make_gamma_market(
+            gamma_id="1002", condition_id="0xc2", token_ids=["333", "444"]))
+        dataset["books"]["333"] = fakes.make_book(0.49, 0.51)
+        if resolved:
+            for market in dataset["gamma_markets"]:
+                market.update(closed=True, outcomePrices=json.dumps(["1", "0"]),
+                              umaResolutionStatus="resolved")
+
+        async def seed_second_market():
+            async with container.session_factory() as session:
+                market = Market(polymarket_market_id="1002", condition_id="0xc2",
+                                question="Second market", yes_token_id="333", no_token_id="444")
+                session.add(market)
+                await session.flush()
+                trade = await container.paper_trades.create_manual(
+                    session, market_row=market, direction="YES", notional=50,
+                    entry_price=0.5, signal_id=None)
+                await session.commit()
+                return trade.trade_uid
+
+        second_id = client.portal.call(seed_second_market)
+        real_process = container.position_monitor._process_market
+
+        async def fail_after_writes(session, market, trades, now, result):
+            await real_process(session, market, trades, now, result)
+            if market.polymarket_market_id == "1001":
+                raise ConflictError("forced concurrent exit after pending monitor writes")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(container.position_monitor, "_process_market", fail_after_writes)
+            result = _run_monitor(client)
+        assert result["open_trades"] == 2
+        assert result["errors"] == ["1001: ConflictError"]
+        assert result["observations"] == 1
+        assert result["settled"] == int(resolved)
+        assert _ledger(client, opened["paper_trade_id"])[0]["status"] == "OPEN"
+        assert _observations(client, opened["paper_trade_id"])["exits"] == []
+        assert _observations(client, opened["paper_trade_id"])["observations"] == []
+        second = _observations(client, second_id)
+        assert len(second["observations"]) == 1
+        assert len(second["exits"]) == int(resolved)
+        # The market whose transaction rolled back remains eligible for another pass.
+        assert _run_monitor(client)["errors"] == []

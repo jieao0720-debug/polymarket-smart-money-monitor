@@ -225,17 +225,20 @@ class PaperTradeService:
         return trade
 
     async def settle(self, session: AsyncSession, trade: PaperTrade, payout: float,
-                     settled_at: datetime) -> PaperTrade:
-        """Close what remains of an OPEN trade at the official payout (A25). Idempotent."""
+                     settled_at: datetime) -> PaperTradeExit | None:
+        """Close the remaining shares at the official payout (A25).
+
+        Return the actual settlement fill, or None if already closed. Callers must use
+        this fill and the refreshed trade to report settlement, not a pre-refresh balance.
+        """
         # The monitor loaded `trade` before its network calls; re-read what is held now.
         await session.refresh(trade, with_for_update=True)
         if trade.status != "OPEN":
-            return trade
+            return None
         if not (0 <= payout <= 1):
             raise ValidationFailed("settlement payout must be within [0, 1]")
-        await self.record_exit(session, trade, shares=trade.open_shares, price=payout,
-                               at=settled_at, reason=EXIT_REASON_RESOLVED)
-        return trade
+        return await self.record_exit(session, trade, shares=trade.open_shares, price=payout,
+                                      at=settled_at, reason=EXIT_REASON_RESOLVED)
 
     async def record_exit(self, session: AsyncSession, trade: PaperTrade, *, shares: float,
                           price: float, at: datetime, reason: str,
