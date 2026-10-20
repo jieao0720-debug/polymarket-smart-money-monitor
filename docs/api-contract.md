@@ -163,17 +163,23 @@ Body: `{ "wallet_address": "0x..", "manual_confirmation": true }`。
   "notional": 50, "entry_price": 0.62 }
 ```
 
-`entry_price` 缺省 → 用该市场最新快照对应方向价格。Response 201 = PaperTrade 对象：
+`entry_price` 缺省 → 用该市场最新快照对应方向的卖一价（A24）。Response 201 = PaperTrade 对象：
 
 ```json
 { "paper_trade_id": "s", "signal_id": "s|null", "market_id": "s", "question": "s",
   "direction": "YES", "entry_price": 0.62, "entry_time": "dt", "notional": 50,
   "shares": 80.6452, "exit_price": null, "exit_time": null, "pnl": null,
-  "unrealized_pnl": 1.2, "current_price": 0.635, "status": "OPEN", "source": "MANUAL" }
+  "unrealized_pnl": 1.2, "current_price": 0.635, "price_basis": "BID",
+  "price_as_of": "dt", "status": "OPEN", "source": "MANUAL", "exit_reason": null,
+  "shadow": { "observed_at": "dt", "market_status": "OPEN", "retention": 0.82,
+    "coverage": 1.0, "liquidation_return": -0.04, "target_fraction": 1.0, "triggers": [] } }
 ```
 
 口径：`shares = notional / entry_price`；`pnl = shares * (exit_price - entry_price)`；
 `unrealized_pnl = shares * (current_price - entry_price)`（仅 OPEN 且有最新价时返回，可为 null）。
+`current_price` 为持有方向**买一价**（A24），`price_basis=MIDPOINT` 表示没有买一价记录、退回了中间价。
+`exit_reason`：MANUAL / RESOLVED。`shadow` 为最新一次持仓监控的影子退出结果（A27，只记录，不执行），
+`triggers` 是已触发过的规则（COHORT_REDUCE / COHORT_EXIT / SIGNAL_FLIP / STOP_LOSS）；未监控过为 null。
 
 ## 10. GET /api/paper-trades
 
@@ -187,7 +193,37 @@ Query：`status` `market_id` `limit` `offset`。
 
 ### 10b. POST /api/paper-trades/{id}/close
 
-Body: `{ "exit_price": 0.8 }`（缺省 → 最新快照价）。Response：更新后的 PaperTrade（status CLOSED，含 pnl）。
+Body: `{ "exit_price": 0.8 }`（缺省 → 最新买一价，A24）。Response：更新后的 PaperTrade（status CLOSED，`exit_reason=MANUAL`，含 pnl）。
+
+### 10c. POST /api/paper-trades/monitor/run
+
+执行一轮持仓监控（同步返回）：已按官方结算的市场平仓入账（A25），其余 OPEN 仓位各写一条影子观察（A27）。
+不会因其他任何原因平仓或减仓。也可通过 `POSITION_MONITOR_INTERVAL_MINUTES` 定时运行或 `scripts/run_monitor.py`。
+
+```json
+{ "started_at": "dt", "finished_at": "dt", "open_trades": 3, "observations": 3,
+  "settled": 0, "cohorts_backfilled": 0, "errors": [] }
+```
+
+### 10d. GET /api/paper-trades/{id}/observations
+
+Query：`limit`（默认 200）。返回入场跟随名单与观察记录（新到旧）：
+
+```json
+{ "paper_trade_id": "s",
+  "cohort": [ { "wallet_address": "0x..", "entry_shares": 10000, "entry_opposite_shares": 0,
+    "entry_net_exposure": 10000, "entry_value": 6000, "weight": 1.0,
+    "smart_money_score": 78.5, "label": "HIGH_WIN_RATE", "source": "ENTRY" } ],
+  "observations": [ { "observed_at": "dt", "market_status": "OPEN", "best_bid": 0.59,
+    "best_ask": 0.61, "liquidation_price": 0.59, "liquidation_value": 96.7,
+    "liquidation_fill_ratio": 1.0, "liquidation_return": -0.033, "retention": 0.5,
+    "coverage": 1.0, "cohort_detail": [ { "wallet": "0x..", "weight": 1.0,
+      "entry_net_exposure": 10000, "current_net_exposure": 5000, "status": "REDUCED" } ],
+    "latest_signal_direction": "YES", "latest_signal_time": "dt",
+    "shadow_state": { "streaks": { "COHORT_REDUCE": 2 }, "fired_at": { "COHORT_REDUCE": "dt" } },
+    "shadow_triggers": ["COHORT_REDUCE"], "shadow_target_fraction": 0.5,
+    "data_issues": null } ] }
+```
 
 ## 11. GET /api/trading/geoblock
 

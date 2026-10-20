@@ -3,7 +3,16 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import JSON, DateTime, Float, ForeignKey, Index, Integer, String
+from sqlalchemy import (
+    JSON,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -76,6 +85,65 @@ class PaperTrade(Base):
     pnl: Mapped[float | None] = mapped_column(Float, nullable=True)
     status: Mapped[str] = mapped_column(String(16), index=True, default="OPEN")
     source: Mapped[str] = mapped_column(String(16), default="MANUAL")  # AUTO_SIGNAL / MANUAL
+    # MANUAL (user close) / RESOLVED (settled from the official market resolution, A25).
+    exit_reason: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
+
+class PaperTradeCohortMember(Base):
+    """Smart-money account followed at entry (A26). Frozen at entry, never re-ranked:
+    an account that later drops out of the top-20 is still tracked by address."""
+    __tablename__ = "paper_trade_cohort"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    paper_trade_id: Mapped[int] = mapped_column(ForeignKey("paper_trades.id"), index=True)
+    wallet_address: Mapped[str] = mapped_column(String(42))
+    direction: Mapped[str] = mapped_column(String(8))  # the side we bought
+    entry_shares: Mapped[float] = mapped_column(Float)  # shares on our side at entry
+    entry_opposite_shares: Mapped[float] = mapped_column(Float, default=0.0)  # if seen
+    entry_net_exposure: Mapped[float] = mapped_column(Float)  # e_i0 (shares, > 0)
+    entry_value: Mapped[float] = mapped_column(Float)  # USDC value of our-side position
+    weight: Mapped[float] = mapped_column(Float)  # w_i, sums to 1 per trade
+    smart_money_score: Mapped[float] = mapped_column(Float)
+    label: Mapped[str] = mapped_column(String(32))
+    source: Mapped[str] = mapped_column(String(16), default="ENTRY")  # ENTRY / BACKFILL
+    signal_snapshot_time: Mapped[datetime] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    __table_args__ = (UniqueConstraint("paper_trade_id", "wallet_address",
+                                       name="uq_cohort_trade_wallet"),)
+
+
+class PositionObservation(Base):
+    """One position-monitor pass over one OPEN paper trade (A27).
+
+    Shadow mode: `shadow_*` fields record what the exit rules WOULD do. Nothing here is
+    ever executed — the only automatic state change the monitor makes is settlement.
+    """
+    __tablename__ = "position_observations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    paper_trade_id: Mapped[int] = mapped_column(ForeignKey("paper_trades.id"), index=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    # OPEN / AWAITING_RESOLUTION / RESOLVED / UNKNOWN
+    market_status: Mapped[str] = mapped_column(String(24))
+    best_bid: Mapped[float | None] = mapped_column(Float, nullable=True)
+    best_ask: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Sell-side valuation of the whole position against the bid ladder, net of fees.
+    liquidation_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    liquidation_value: Mapped[float | None] = mapped_column(Float, nullable=True)
+    liquidation_fill_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
+    liquidation_return: Mapped[float | None] = mapped_column(Float, nullable=True)
+    retention: Mapped[float | None] = mapped_column(Float, nullable=True)  # R_t over known
+    coverage: Mapped[float | None] = mapped_column(Float, nullable=True)  # known weight
+    cohort_detail: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    latest_signal_direction: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    latest_signal_time: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    shadow_state: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    shadow_triggers: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    shadow_target_fraction: Mapped[float | None] = mapped_column(Float, nullable=True)
+    data_issues: Mapped[list | None] = mapped_column(JSON, nullable=True)
+
+    __table_args__ = (Index("ix_observations_trade_time", "paper_trade_id", "observed_at"),)
 
 
 class WalletConnection(Base):

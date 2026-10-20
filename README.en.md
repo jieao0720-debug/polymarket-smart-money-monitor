@@ -35,7 +35,12 @@ hard multi-layer risk gate.
 - **Paper trading** — qualifying signals auto-log at the side's best ask (honest
   taker price); extreme-price / wide-relative-spread signals are skipped and re-scans
   never stack duplicate open positions, so paper PnL measures signal quality rather
-  than spread cost; manual entries; mark-to-market and close with PnL.
+  than spread cost; manual entries; open positions are marked at the side's best bid,
+  and settle automatically at the official payout once the market resolves.
+- **Position monitor (shadow exits)** — independent of the hot-market scan; tracks
+  how much of their entry position the followed smart-money accounts still hold, and
+  records what the exit rules *would* do without ever reducing or closing a position,
+  so thresholds can be replayed offline (docs/assumptions.md A24–A27).
 - **Wallet & manual live trading** — wagmi/viem wallet connect (address + EIP-712
   signatures only), geoblock/balance/allowance display, trade tickets with two-pass
   backend risk checks and an explicit manual confirmation step.

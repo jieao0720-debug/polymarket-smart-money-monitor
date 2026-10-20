@@ -232,7 +232,7 @@ const en = {
   "paper.closed": "Closed",
   "paper.realizedPnl": "Realized PnL",
   "paper.unrealizedPnl": "Unrealized PnL",
-  "paper.markedNote": "marked at latest snapshot",
+  "paper.markedNote": "marked at best bid",
   "paper.winRateClosed": "Win rate (closed)",
   "paper.thEntryTime": "Entry time",
   "paper.thMarket": "Market",
@@ -252,6 +252,14 @@ const en = {
   "paper.emptyHint":
     "No paper trades yet. Run the scanner (qualifying signals auto-log) or log one from a market's trade ticket.",
   "paper.closeFailed": "Failed to close trade",
+  "paper.closeAtBid": "Close @ bid",
+  "paper.thShadow": "Shadow exit",
+  "paper.shadowTooltip":
+    "Position monitor, shadow mode: what the exit rules WOULD do. Nothing is executed. R = share of the followed smart money's entry position still held.",
+  "paper.shadowHold": "hold {pct}",
+  "paper.shadowRetention": "R {pct}",
+  "paper.settled": "settled",
+  "paper.midFallback": "mid",
 
   // ---------------------------------------------------------------- trading page
   "trading.title": "Wallet / Trading",
@@ -541,7 +549,7 @@ const zh: Record<MessageKey, string> = {
   "paper.closed": "已平仓",
   "paper.realizedPnl": "已实现盈亏",
   "paper.unrealizedPnl": "未实现盈亏",
-  "paper.markedNote": "按最新快照价盯市",
+  "paper.markedNote": "按买一价盯市",
   "paper.winRateClosed": "胜率（已平仓）",
   "paper.thEntryTime": "入场时间",
   "paper.thMarket": "市场",
@@ -560,6 +568,14 @@ const zh: Record<MessageKey, string> = {
   "paper.closing": "平仓中…",
   "paper.emptyHint": "暂无模拟交易。运行扫描（合格信号会自动入账），或在市场详情的交易票据中手动记录。",
   "paper.closeFailed": "平仓失败",
+  "paper.closeAtBid": "按买一价平仓",
+  "paper.thShadow": "影子退出",
+  "paper.shadowTooltip":
+    "持仓监控（影子模式）：退出规则本会怎么做，不会实际执行。R = 入场跟随的聪明钱仍保留的入场仓位比例。",
+  "paper.shadowHold": "保留 {pct}",
+  "paper.shadowRetention": "R {pct}",
+  "paper.settled": "已结算",
+  "paper.midFallback": "中间价",
 
   "trading.title": "钱包 / 交易",
   "trading.subtitle":

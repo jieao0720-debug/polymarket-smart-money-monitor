@@ -21,6 +21,7 @@ from app.services.holder_analysis_service import HolderAnalysisService
 from app.services.market_scanner_service import MarketScannerService
 from app.services.order_submit_service import OrderSubmitService
 from app.services.paper_trade_service import PaperTradeService
+from app.services.position_monitor_service import PositionMonitorService
 from app.services.scan_registry import ScanRegistry
 from app.services.trading_risk_service import TradingRiskService
 
@@ -66,6 +67,10 @@ class Container:
             gamma=self.gamma, clob=self.clob, holder_analysis=self.holder_analysis,
             paper_trades=self.paper_trades, registry=self.registry,
             session_factory=session_factory, settings=settings)
+        self.position_monitor = PositionMonitorService(
+            gamma=self.gamma, clob=self.clob, data=self.data,
+            paper_trades=self.paper_trades, session_factory=session_factory,
+            settings=settings)
         self.background_tasks: set[asyncio.Task] = set()
 
     def spawn(self, coro) -> asyncio.Task:

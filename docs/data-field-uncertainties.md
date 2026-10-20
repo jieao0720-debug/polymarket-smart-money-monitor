@@ -53,3 +53,10 @@
   以链上调用验证 allowance 目标的正确性）。live 启用前用 polygonscan 核对一次。
 - **U13 `profile_name`**：data-api 返回 `name` 与 `pseudonym` 两字段，公开展示规则由 `displayUsernamePublic` 控制；
   我们优先 name(若 displayUsernamePublic) 否则 pseudonym。仅展示用途。
+- **U14 Gamma 结算字段**：`umaResolutionStatus`（如 `resolved`/`proposed`）、`closedTime`、`closed` 后的 `outcomePrices`
+  2026-10-20 用一个已结算市场实测（gamma id 2270330：`closed=true`、`outcomePrices=["1","0"]`、
+  `umaResolutionStatus="resolved"`、`closedTime="2026-06-18 00:32:19+00"`，注意已结算时 `active` 仍为 true），
+  字段与解析一致；50/50 结算与争议中市场的字段形态仍未实测。处理：结算判定取保守口径（见 assumptions A25），
+  任一条件不满足即保持 OPEN 并标 AWAITING_RESOLUTION。
+- **U15 `/positions` 小额门槛**：Data-API 默认 `sizeThreshold` 会过滤极小持仓，低于门槛的残余份额会被视为 0。
+  对跟随名单的保留率影响可忽略（入场账户都是大额持仓）。

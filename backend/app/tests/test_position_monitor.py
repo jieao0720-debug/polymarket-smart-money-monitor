@@ -1,0 +1,398 @@
+"""Settlement, bid-side marking, entry cohort and SHADOW exit observations (A24–A27)."""
+from __future__ import annotations
+
+import json
+from datetime import datetime, timedelta
+
+import pytest
+from sqlalchemy import create_engine, inspect, text
+
+from app.db.init_db import add_missing_nullable_columns
+from app.models import MarketSnapshot, PaperTradeCohortMember, PositionObservation
+from app.services.exit_rules import (
+    MARKET_AWAITING_RESOLUTION,
+    MARKET_OPEN,
+    MARKET_RESOLVED,
+    TRIGGER_COHORT_EXIT,
+    TRIGGER_COHORT_REDUCE,
+    TRIGGER_STOP_LOSS,
+    HolderRecord,
+    MemberExposure,
+    ShadowThresholds,
+    build_cohort,
+    compute_retention,
+    evaluate_shadow,
+    liquidation_quote,
+    resolve_market,
+)
+from app.services.normalization import normalize_market
+from app.services.paper_trade_service import MARK_BASIS_BID, MARK_BASIS_MIDPOINT, pick_mark
+from app.tests import fakes
+from app.tests.conftest import run_scan_and_wait
+
+NOW = datetime(2026, 10, 20, 12, 0, 0)
+
+
+# ----------------------------------------------------------------- settlement
+
+def _market(**kw):
+    raw = fakes.make_gamma_market(**{k: v for k, v in kw.items()
+                                     if k not in ("uma", "closed_time")})
+    if "uma" in kw:
+        raw["umaResolutionStatus"] = kw["uma"]
+    if "closed_time" in kw:
+        raw["closedTime"] = kw["closed_time"]
+    return normalize_market(raw)
+
+
+class TestResolveMarket:
+    def test_open_market(self):
+        assert resolve_market(_market()).status == MARKET_OPEN
+
+    def test_resolved_yes(self):
+        res = resolve_market(_market(closed=True, prices=["1", "0"], uma="resolved"))
+        assert res.status == MARKET_RESOLVED
+        assert res.payout("YES") == 1.0 and res.payout("NO") == 0.0
+
+    def test_payout_respects_outcome_order(self):
+        """Index 0 is never assumed YES: outcomes [No, Yes] with prices [1, 0] → NO wins."""
+        res = resolve_market(_market(closed=True, outcomes=["No", "Yes"],
+                                     prices=["1", "0"], uma="resolved"))
+        assert res.payout("NO") == 1.0 and res.payout("YES") == 0.0
+
+    def test_closed_but_uma_not_final(self):
+        res = resolve_market(_market(closed=True, prices=["1", "0"], uma="proposed"))
+        assert res.status == MARKET_AWAITING_RESOLUTION
+
+    def test_closed_with_non_payout_prices(self):
+        res = resolve_market(_market(closed=True, prices=["0.985", "0.015"]))
+        assert res.status == MARKET_AWAITING_RESOLUTION
+
+    def test_split_needs_explicit_uma_status(self):
+        assert resolve_market(_market(closed=True, prices=["0.5", "0.5"])).status \
+            == MARKET_AWAITING_RESOLUTION
+        res = resolve_market(_market(closed=True, prices=["0.5", "0.5"], uma="resolved"))
+        assert res.status == MARKET_RESOLVED and res.payout("YES") == 0.5
+
+    def test_past_end_date_is_not_settlement(self):
+        market = _market(end_in_hours=-3)
+        assert resolve_market(market, fakes.now_utc()).status == MARKET_AWAITING_RESOLUTION
+
+    def test_closed_time_parsed(self):
+        market = _market(closed=True, closed_time="2026-10-19 08:30:00+00")
+        assert market.closed_time == datetime(2026, 10, 19, 8, 30)
+
+
+# ----------------------------------------------------------------- valuation
+
+class TestLiquidationQuote:
+    def test_walks_ladder_best_first(self):
+        q = liquidation_quote([(0.55, 100), (0.59, 50)], 100)
+        assert q.fill_ratio == 1.0
+        assert q.value == pytest.approx(50 * 0.59 + 50 * 0.55)
+        assert q.price == pytest.approx(0.57)
+
+    def test_partial_fill_counts_only_filled(self):
+        q = liquidation_quote([(0.5, 40)], 100)
+        assert q.fill_ratio == pytest.approx(0.4)
+        assert q.value == pytest.approx(20.0)
+
+    def test_fee_and_empty_book(self):
+        assert liquidation_quote([(0.5, 100)], 100, fee_bps=100).value == pytest.approx(49.5)
+        empty = liquidation_quote([], 100)
+        assert empty.price is None and empty.fill_ratio == 0
+
+
+class TestPickMark:
+    def _snap(self, t, **kw):
+        return MarketSnapshot(market_id=1, snapshot_time=t, **kw)
+
+    def test_bid_not_midpoint(self):
+        snap = self._snap(NOW, yes_price=0.60, no_price=0.40, best_bid=0.59,
+                          orderbook_depth={"no": {"best_bid": 0.39}})
+        assert pick_mark(direction="YES", snapshot=snap, observation=None).price == 0.59
+        mark = pick_mark(direction="NO", snapshot=snap, observation=None)
+        assert (mark.price, mark.basis) == (0.39, MARK_BASIS_BID)
+
+    def test_newest_source_wins(self):
+        snap = self._snap(NOW, best_bid=0.59)
+        obs = PositionObservation(observed_at=NOW + timedelta(minutes=5), best_bid=0.52)
+        assert pick_mark(direction="YES", snapshot=snap, observation=obs).price == 0.52
+
+    def test_midpoint_fallback_is_labelled(self):
+        snap = self._snap(NOW, yes_price=0.6, no_price=0.4)  # legacy: no NO-side bid
+        mark = pick_mark(direction="NO", snapshot=snap, observation=None)
+        assert (mark.price, mark.basis) == (0.4, MARK_BASIS_MIDPOINT)
+
+
+# ----------------------------------------------------------------- cohort & retention
+
+def _h(wallet, direction, shares, value, smart=True):
+    return HolderRecord(wallet, direction, shares, value, 80.0, "HIGH_WIN_RATE", smart)
+
+
+class TestCohort:
+    def test_weights_and_net_exposure(self):
+        cohort = build_cohort([
+            _h("a", "YES", 1000, 600), _h("b", "YES", 500, 300),
+            _h("b", "NO", 200, 80, smart=False),  # opposite holding nets against b
+            _h("c", "YES", 900, 540, smart=False),  # not smart → excluded
+            _h("d", "NO", 800, 300),  # other side → excluded
+        ], "YES")
+        by_wallet = {c.wallet_address: c for c in cohort}
+        assert set(by_wallet) == {"a", "b"}
+        assert by_wallet["b"].entry_net_exposure == 300
+        assert by_wallet["a"].weight == pytest.approx(600 / 900)
+        assert sum(c.weight for c in cohort) == pytest.approx(1.0)
+
+    def test_fully_hedged_account_excluded(self):
+        assert build_cohort([_h("a", "YES", 100, 60), _h("a", "NO", 100, 40)], "YES") == []
+
+
+class TestRetention:
+    def test_unknown_excluded_not_zero(self):
+        r, cov = compute_retention([MemberExposure(0.6, 1000, 500),
+                                    MemberExposure(0.4, 500, None)])
+        assert cov == pytest.approx(0.6)
+        assert r == pytest.approx(0.5)
+
+    def test_adds_capped_reversal_floored(self):
+        r, _ = compute_retention([MemberExposure(0.5, 1000, 3000),  # added: capped at 1
+                                  MemberExposure(0.5, 1000, -400)])  # reversed: 0
+        assert r == pytest.approx(0.5)
+
+    def test_all_unknown(self):
+        assert compute_retention([MemberExposure(1.0, 10, None)]) == (None, 0.0)
+
+
+class TestShadowEvaluation:
+    T = ShadowThresholds(confirmations=2)
+
+    def _eval(self, prev=None, prev_target=None, **kw):
+        args = dict(retention=1.0, coverage=1.0, liquidation_return=0.0,
+                    signal_flipped=False)
+        args.update(kw)
+        return evaluate_shadow(previous_state=prev, previous_target=prev_target,
+                               observed_at_iso="t", thresholds=self.T, **args)
+
+    def test_needs_consecutive_confirmation(self):
+        first = self._eval(retention=0.6)
+        assert first.fired == [] and first.target_fraction == 1.0
+        second = self._eval(prev=first.state, retention=0.6)
+        assert second.fired == [TRIGGER_COHORT_REDUCE]
+        assert second.target_fraction == 0.5
+
+    def test_recovery_resets_streak(self):
+        first = self._eval(retention=0.6)
+        reset = self._eval(prev=first.state, retention=0.9)
+        assert self._eval(prev=reset.state, retention=0.6).fired == []
+
+    def test_unknown_data_keeps_streak(self):
+        first = self._eval(retention=0.3)
+        gap = self._eval(prev=first.state, retention=None, coverage=0.0)
+        assert gap.state["streaks"][TRIGGER_COHORT_EXIT] == 1
+        low_cov = self._eval(prev=gap.state, retention=0.3, coverage=0.5)
+        assert low_cov.fired == []
+        done = self._eval(prev=low_cov.state, retention=0.3)
+        assert TRIGGER_COHORT_EXIT in done.fired and done.target_fraction == 0.0
+
+    def test_target_is_sticky(self):
+        r = self._eval(prev={"streaks": {TRIGGER_COHORT_REDUCE: 5}}, retention=0.95,
+                       prev_target=0.5)
+        assert r.target_fraction == 0.5  # cohort re-bought; a reduction is not undone
+
+    def test_stop_loss(self):
+        first = self._eval(liquidation_return=-0.3)
+        assert TRIGGER_STOP_LOSS in self._eval(prev=first.state,
+                                               liquidation_return=-0.3).fired
+
+
+# ----------------------------------------------------------------- end-to-end
+
+def _run_monitor(client):
+    resp = client.post("/api/paper-trades/monitor/run")
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def _open_trade(client):
+    trades = client.get("/api/paper-trades").json()["paper_trades"]
+    assert len(trades) == 1
+    return trades[0]
+
+
+def _observations(client, trade_id):
+    return client.get(f"/api/paper-trades/{trade_id}/observations").json()
+
+
+class TestPositionMonitorFlow:
+    def test_entry_freezes_cohort_and_marks_at_bid(self, app_bundle):
+        client, _, _ = app_bundle
+        run_scan_and_wait(client)
+        trade = _open_trade(client)
+        assert trade["current_price"] == 0.59  # YES best bid, not the 0.60 midpoint
+        assert trade["price_basis"] == "BID"
+        cohort = _observations(client, trade["paper_trade_id"])["cohort"]
+        assert [m["wallet_address"] for m in cohort] == [fakes.ADDR_SMART]
+        assert cohort[0]["entry_net_exposure"] == 10000
+        assert cohort[0]["weight"] == pytest.approx(1.0)
+        assert cohort[0]["source"] == "ENTRY"
+
+    def test_holding_cohort_records_full_retention(self, app_bundle):
+        client, _, _ = app_bundle
+        run_scan_and_wait(client)
+        result = _run_monitor(client)
+        assert (result["open_trades"], result["observations"], result["settled"]) == (1, 1, 0)
+        trade = _open_trade(client)
+        obs = _observations(client, trade["paper_trade_id"])["observations"][0]
+        assert obs["market_status"] == "OPEN"
+        assert obs["retention"] == 1.0 and obs["coverage"] == 1.0
+        assert obs["best_bid"] == 0.59
+        assert obs["shadow_target_fraction"] == 1.0
+        assert trade["shadow"]["retention"] == 1.0
+
+    def test_cohort_reduction_is_shadow_only(self, app_bundle):
+        client, _, dataset = app_bundle
+        run_scan_and_wait(client)
+        dataset["positions"][(fakes.ADDR_SMART, "0xc1")] = [fakes.make_position(
+            fakes.ADDR_SMART, "0xc1", "111", "Yes", size=5000, avg_price=0.55,
+            cur_price=0.60)]
+        _run_monitor(client)
+        _run_monitor(client)
+        trade = _open_trade(client)
+        assert trade["status"] == "OPEN"  # shadow mode never acts
+        obs = _observations(client, trade["paper_trade_id"])["observations"]
+        assert obs[1]["shadow_triggers"] is None  # first sighting: not yet confirmed
+        assert obs[0]["retention"] == 0.5
+        assert obs[0]["shadow_triggers"] == [TRIGGER_COHORT_REDUCE]
+        assert obs[0]["shadow_target_fraction"] == 0.5
+        assert obs[0]["cohort_detail"][0]["status"] == "REDUCED"
+        assert trade["shadow"]["triggers"] == [TRIGGER_COHORT_REDUCE]
+
+    def test_cohort_exit_and_reversal(self, app_bundle):
+        client, _, dataset = app_bundle
+        run_scan_and_wait(client)
+        dataset["positions"][(fakes.ADDR_SMART, "0xc1")] = [fakes.make_position(
+            fakes.ADDR_SMART, "0xc1", "222", "No", size=4000, avg_price=0.4,
+            cur_price=0.41)]
+        _run_monitor(client)
+        _run_monitor(client)
+        trade = _open_trade(client)
+        obs = _observations(client, trade["paper_trade_id"])["observations"][0]
+        assert obs["retention"] == 0.0
+        assert obs["cohort_detail"][0]["status"] == "REVERSED"
+        assert obs["shadow_target_fraction"] == 0.0
+
+    def test_fetch_failure_is_unknown_not_exit(self, app_bundle):
+        client, _, dataset = app_bundle
+        run_scan_and_wait(client)
+        dataset["positions_fail"] = {fakes.ADDR_SMART}
+        _run_monitor(client)
+        _run_monitor(client)
+        trade = _open_trade(client)
+        obs = _observations(client, trade["paper_trade_id"])["observations"][0]
+        assert obs["retention"] is None and obs["coverage"] == 0.0
+        assert obs["cohort_detail"][0]["status"] == "UNKNOWN"
+        assert obs["shadow_target_fraction"] == 1.0
+        assert any("unknown" in issue for issue in obs["data_issues"])
+
+    def test_flat_account_is_known_exit(self, app_bundle):
+        client, _, dataset = app_bundle
+        run_scan_and_wait(client)
+        dataset["positions"][(fakes.ADDR_SMART, "0xc1")] = []
+        _run_monitor(client)
+        trade = _open_trade(client)
+        obs = _observations(client, trade["paper_trade_id"])["observations"][0]
+        assert obs["retention"] == 0.0 and obs["coverage"] == 1.0
+        assert obs["cohort_detail"][0]["status"] == "EXITED"
+
+    def test_settles_resolved_market(self, app_bundle):
+        client, _, dataset = app_bundle
+        run_scan_and_wait(client)
+        market = dataset["gamma_markets"][0]
+        market.update(closed=True, active=False, outcomePrices=json.dumps(["1", "0"]),
+                      umaResolutionStatus="resolved", closedTime="2026-10-19 08:30:00+00")
+        result = _run_monitor(client)
+        assert result["settled"] == 1
+        trade = _open_trade(client)
+        assert trade["status"] == "CLOSED"
+        assert trade["exit_reason"] == "RESOLVED"
+        assert trade["exit_price"] == 1.0
+        assert trade["exit_time"].startswith("2026-10-19T08:30")
+        assert trade["pnl"] == pytest.approx(trade["shares"] * (1.0 - 0.61), abs=1e-3)
+        assert _run_monitor(client)["open_trades"] == 0  # settled once, never again
+
+    def test_settles_losing_side_at_zero(self, app_bundle):
+        client, _, dataset = app_bundle
+        run_scan_and_wait(client)
+        dataset["gamma_markets"][0].update(
+            closed=True, outcomePrices=json.dumps(["0", "1"]),
+            umaResolutionStatus="resolved")
+        _run_monitor(client)
+        trade = _open_trade(client)
+        assert trade["exit_price"] == 0.0
+        assert trade["pnl"] == pytest.approx(-trade["notional"], abs=1e-3)
+
+    def test_closed_unresolved_market_stays_open(self, app_bundle):
+        client, _, dataset = app_bundle
+        run_scan_and_wait(client)
+        dataset["gamma_markets"][0].update(closed=True,
+                                          outcomePrices=json.dumps(["0.99", "0.01"]))
+        assert _run_monitor(client)["settled"] == 0
+        trade = _open_trade(client)
+        assert trade["status"] == "OPEN"
+        obs = _observations(client, trade["paper_trade_id"])["observations"][0]
+        assert obs["market_status"] == "AWAITING_RESOLUTION"
+
+    def test_backfills_cohort_for_existing_trades(self, app_bundle):
+        client, container, _ = app_bundle
+        run_scan_and_wait(client)
+
+        async def wipe() -> None:
+            async with container.session_factory() as session:
+                await session.execute(PaperTradeCohortMember.__table__.delete())
+                await session.commit()
+
+        client.portal.call(wipe)
+        result = _run_monitor(client)
+        assert result["cohorts_backfilled"] == 1
+        trade = _open_trade(client)
+        cohort = _observations(client, trade["paper_trade_id"])["cohort"]
+        assert cohort[0]["source"] == "BACKFILL"
+
+    def test_manual_trade_without_signal_has_no_cohort(self, app_bundle):
+        client, _, _ = app_bundle
+        run_scan_and_wait(client)
+        manual = client.post("/api/paper-trades", json={
+            "market_id": "1001", "direction": "NO", "notional": 50}).json()
+        assert manual["entry_price"] == 0.41  # default entry = NO best ask
+        _run_monitor(client)
+        obs = _observations(client, manual["paper_trade_id"])["observations"][0]
+        assert obs["retention"] is None and obs["coverage"] is None
+        assert obs["best_bid"] == 0.39
+
+    def test_manual_close_defaults_to_bid(self, app_bundle):
+        client, _, _ = app_bundle
+        run_scan_and_wait(client)
+        trade = _open_trade(client)
+        closed = client.post(f"/api/paper-trades/{trade['paper_trade_id']}/close",
+                             json={}).json()
+        assert closed["exit_price"] == 0.59
+        assert closed["exit_reason"] == "MANUAL"
+
+
+# ----------------------------------------------------------------- migration
+
+def test_add_missing_nullable_columns_on_legacy_table():
+    engine = create_engine("sqlite://")
+    with engine.begin() as conn:
+        conn.execute(text(
+            "CREATE TABLE paper_trades (id INTEGER PRIMARY KEY, trade_uid VARCHAR(32), "
+            "market_id INTEGER, direction VARCHAR(8), entry_price FLOAT, "
+            "entry_time DATETIME, notional FLOAT, shares FLOAT, status VARCHAR(16), "
+            "source VARCHAR(16))"))
+        added = add_missing_nullable_columns(conn)
+        assert "paper_trades.exit_reason" in added
+        cols = {c["name"] for c in inspect(conn).get_columns("paper_trades")}
+        assert "exit_reason" in cols
+        assert add_missing_nullable_columns(conn) == []  # idempotent

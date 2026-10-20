@@ -74,6 +74,22 @@ class Settings(BaseSettings):
     paper_trade_max_relative_spread: float = Field(
         default=0.10, alias="PAPER_TRADE_MAX_RELATIVE_SPREAD")
 
+    # --- position monitor / settlement / shadow exits (A24–A27) ---
+    # Independent of the scanner: 0 disables the periodic pass (manual run still works).
+    position_monitor_interval_minutes: int = Field(
+        default=0, alias="POSITION_MONITOR_INTERVAL_MINUTES")
+    # Taker fee assumed when valuing a sale into the bid ladder (0 = fee-free market).
+    paper_exit_fee_bps: float = Field(default=0.0, alias="PAPER_EXIT_FEE_BPS")
+    # Shadow exit rules are RECORDED ONLY — they never close or reduce a position.
+    # Starting parameters for offline replay, not validated values.
+    shadow_exit_retention_reduce: float = Field(
+        default=0.70, alias="SHADOW_EXIT_RETENTION_REDUCE")
+    shadow_exit_retention_exit: float = Field(default=0.40, alias="SHADOW_EXIT_RETENTION_EXIT")
+    shadow_exit_min_coverage: float = Field(default=0.70, alias="SHADOW_EXIT_MIN_COVERAGE")
+    shadow_exit_confirmations: int = Field(default=2, alias="SHADOW_EXIT_CONFIRMATIONS")
+    shadow_exit_stop_loss_return: float = Field(
+        default=-0.25, alias="SHADOW_EXIT_STOP_LOSS_RETURN")
+
     # --- http ---
     http_timeout_seconds: float = Field(default=15.0, alias="HTTP_TIMEOUT_SECONDS")
     http_retries: int = Field(default=3, alias="HTTP_RETRIES")

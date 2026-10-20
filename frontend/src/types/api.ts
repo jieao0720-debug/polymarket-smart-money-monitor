@@ -240,9 +240,24 @@ export interface PaperTrade {
   exit_time: string | null;
   pnl: number | null;
   unrealized_pnl: number | null;
-  current_price: number | null;
+  current_price: number | null; // side best bid
+  price_basis?: "BID" | "MIDPOINT" | null;
+  price_as_of?: string | null;
   status: PaperTradeStatus;
   source: string;
+  exit_reason?: "MANUAL" | "RESOLVED" | null;
+  shadow?: ShadowExitSummary | null;
+}
+
+/** Latest position-monitor view — shadow mode: recorded, never executed. */
+export interface ShadowExitSummary {
+  observed_at: string;
+  market_status: string;
+  retention: number | null;
+  coverage: number | null;
+  liquidation_return: number | null;
+  target_fraction: number | null;
+  triggers: string[];
 }
 
 export interface PaperTradesResponse {

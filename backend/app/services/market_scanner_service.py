@@ -29,6 +29,7 @@ from app.models import (
     MarketSnapshot,
     SmartMoneySignal,
 )
+from app.services.cohort_service import capture_cohort
 from app.services.holder_analysis_service import AnalyzedHolder, HolderAnalysisService
 from app.services.normalization import (
     NormalizedBook,
@@ -54,6 +55,15 @@ logger = logging.getLogger("app.scanner")
 
 def _utcnow() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
+
+
+def _book_summary(book: NormalizedBook | None) -> dict | None:
+    """Per-side top of book + depth; best_bid is the paper mark price (A24)."""
+    if book is None:
+        return None
+    return {"best_bid": book.best_bid, "best_ask": book.best_ask,
+            "bid_depth_usdc": book.bid_depth_usdc, "ask_depth_usdc": book.ask_depth_usdc,
+            "top3_ask_usdc": book.top3_ask_usdc}
 
 
 @dataclass
@@ -203,13 +213,17 @@ class MarketScannerService:
                     max_relative_spread=self.settings.paper_trade_max_relative_spread)
                 if decision.should_log:
                     assert entry_price is not None
-                    await self.paper_trades.auto_log(
+                    trade = await self.paper_trades.auto_log(
                         session, market_row=market_row, signal_uid=signal_row.signal_uid,
                         direction=signal.direction, entry_price=entry_price,
                         entry_time=now,
                         notional=min(self.settings.paper_trade_default_notional,
                                      signal.suggested_max_notional
                                      or self.settings.paper_trade_default_notional))
+                    if trade is not None:
+                        await capture_cohort(
+                            session, trade, smart_money_score_threshold=(
+                                self.settings.smart_money_score_threshold))
                     await session.commit()
                 else:
                     logger.debug("paper auto-log skipped for market %s: %s",
@@ -259,14 +273,7 @@ class MarketScannerService:
             midpoint=yes_book.midpoint if yes_book else None,
             best_bid=yes_book.best_bid if yes_book else market.best_bid_hint,
             best_ask=yes_book.best_ask if yes_book else market.best_ask_hint,
-            orderbook_depth={
-                "yes": {"bid_depth_usdc": yes_book.bid_depth_usdc,
-                        "ask_depth_usdc": yes_book.ask_depth_usdc,
-                        "top3_ask_usdc": yes_book.top3_ask_usdc} if yes_book else None,
-                "no": {"bid_depth_usdc": no_book.bid_depth_usdc,
-                       "ask_depth_usdc": no_book.ask_depth_usdc,
-                       "top3_ask_usdc": no_book.top3_ask_usdc} if no_book else None,
-            },
+            orderbook_depth={"yes": _book_summary(yes_book), "no": _book_summary(no_book)},
             volume_24h=market.volume_24h, liquidity=market.liquidity,
             open_interest=market.open_interest_event))
 

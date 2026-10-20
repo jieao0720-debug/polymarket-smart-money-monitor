@@ -59,7 +59,10 @@ backend/app/
     smart_money_service.py      # 账户分类（4 标签）+ scoring.py 分项 + 总分
     scoring.py                  # score 分项函数（每项独立、可单测）
     signal_service.py           # 市场级聚合：方向/confidence/risk flags/建议价与额度
-    paper_trade_service.py      # 信号自动入账、手动记录、平仓 PnL
+    paper_trade_service.py      # 信号自动入账、手动记录、买一价计价、平仓/结算 PnL
+    cohort_service.py           # 冻结入场跟随的聪明钱账户（A26）
+    position_monitor_service.py # 独立持仓监控：结算入账 + 影子退出观察（A25/A27）
+    exit_rules.py               # 纯函数：结算判定、买盘深度估值、保留率、影子退出规则
     trading_risk_service.py     # 8 项风控检查（geoblock/market/spread/notional/balance/allowance/live flag/价格合法性）
     order_submit_service.py     # 二次风控 + ENABLE_LIVE_TRADING 闸门 + CLOB 提交
     scan_registry.py            # 进程内 scan 状态注册表
@@ -120,7 +123,7 @@ backend/app/
 
 - geoblock fail-closed：geoblock 接口请求失败时按 **blocked** 处理，禁止开仓。
 - close-only（官方名单 PL/SG/TH/TW，env 可调）：can_open=false、can_close=true；开新仓票据直接拒绝。
-- 后端无任何自动下单代码路径；scheduler 只做扫描，不触达 order_submit_service。
+- 后端无任何自动下单代码路径；scheduler 只做扫描与持仓监控（只结算模拟仓位、记录影子退出），不触达 order_submit_service。
 
 ## 8. Deployment Architecture
 

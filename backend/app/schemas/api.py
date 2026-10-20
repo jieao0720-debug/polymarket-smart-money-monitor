@@ -265,6 +265,17 @@ class PaperTradeCloseRequest(BaseModel):
     exit_price: float | None = Field(default=None, ge=0, le=1)
 
 
+class ShadowExitSummary(BaseModel):
+    """Latest position-monitor view. Shadow mode: recorded, never executed (A27)."""
+    observed_at: datetime
+    market_status: str
+    retention: float | None
+    coverage: float | None
+    liquidation_return: float | None
+    target_fraction: float | None
+    triggers: list[str] = Field(default_factory=list)
+
+
 class PaperTradeEntry(BaseModel):
     paper_trade_id: str
     signal_id: str | None
@@ -279,9 +290,13 @@ class PaperTradeEntry(BaseModel):
     exit_time: datetime | None
     pnl: float | None
     unrealized_pnl: float | None = None
-    current_price: float | None = None
+    current_price: float | None = None  # side best bid (A24)
+    price_basis: str | None = None  # BID / MIDPOINT (fallback when no bid recorded)
+    price_as_of: datetime | None = None
     status: PaperTradeStatus
     source: str
+    exit_reason: str | None = None  # MANUAL / RESOLVED
+    shadow: ShadowExitSummary | None = None
 
 
 class PaperTradeSummary(BaseModel):
@@ -291,6 +306,54 @@ class PaperTradeSummary(BaseModel):
     total_unrealized_pnl: float = 0
     win_count: int = 0
     loss_count: int = 0
+
+
+class PositionObservationEntry(BaseModel):
+    observed_at: datetime
+    market_status: str
+    best_bid: float | None
+    best_ask: float | None
+    liquidation_price: float | None
+    liquidation_value: float | None
+    liquidation_fill_ratio: float | None
+    liquidation_return: float | None
+    retention: float | None
+    coverage: float | None
+    cohort_detail: list[dict[str, Any]] | None
+    latest_signal_direction: str | None
+    latest_signal_time: datetime | None
+    shadow_state: dict[str, Any] | None
+    shadow_triggers: list[str] | None
+    shadow_target_fraction: float | None
+    data_issues: list[str] | None
+
+
+class CohortMemberEntry(BaseModel):
+    wallet_address: str
+    entry_shares: float
+    entry_opposite_shares: float
+    entry_net_exposure: float
+    entry_value: float
+    weight: float
+    smart_money_score: float
+    label: str
+    source: str
+
+
+class PositionObservationsResponse(BaseModel):
+    paper_trade_id: str
+    cohort: list[CohortMemberEntry]
+    observations: list[PositionObservationEntry]
+
+
+class MonitorRunResponse(BaseModel):
+    started_at: datetime
+    finished_at: datetime | None
+    open_trades: int
+    observations: int
+    settled: int
+    cohorts_backfilled: int
+    errors: list[str]
 
 
 class PaperTradesResponse(BaseModel):

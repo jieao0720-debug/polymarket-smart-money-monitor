@@ -26,7 +26,7 @@ export default function PaperTradesPage() {
     setClosing(id);
     setError(null);
     try {
-      await api.closePaperTrade(id); // exit at latest snapshot price
+      await api.closePaperTrade(id); // exit at the latest best bid
       await queryClient.invalidateQueries({ queryKey: ["paper-trades"] });
     } catch (e) {
       setError(e instanceof ApiError ? `${e.code}: ${e.message}` : t("paper.closeFailed"));
@@ -90,6 +90,7 @@ export default function PaperTradesPage() {
                 <Th>{t("paper.thNowExit")}</Th>
                 <Th><SortHeader label={t("paper.thPnl")} sortId="pnl" activeKey={sortKey} desc={desc} onToggle={toggle} /></Th>
                 <Th>{t("paper.thStatus")}</Th>
+                <Th><span title={t("paper.shadowTooltip")}>{t("paper.thShadow")}</span></Th>
                 <Th></Th>
               </tr>
             </THead>
@@ -115,6 +116,9 @@ export default function PaperTradesPage() {
                     <Td className="tabular-nums">{formatNumber(trade.shares)}</Td>
                     <Td className="tabular-nums">
                       {trade.status === "CLOSED" ? formatCents(trade.exit_price) : formatCents(trade.current_price)}
+                      {trade.status === "OPEN" && trade.price_basis === "MIDPOINT" && (
+                        <span className="ml-1 text-[10px] text-muted">{t("paper.midFallback")}</span>
+                      )}
                     </Td>
                     <Td className={`tabular-nums ${pnl != null && pnl < 0 ? "text-no" : pnl != null ? "text-yes" : ""}`}>
                       {formatSignedUsd(pnl)}
@@ -122,11 +126,19 @@ export default function PaperTradesPage() {
                         <span className="ml-1 text-[10px] text-muted">{t("paper.unrealizedTag")}</span>
                       )}
                     </Td>
-                    <Td><Badge variant={trade.status === "OPEN" ? "accent" : "neutral"}>{trade.status}</Badge></Td>
+                    <Td>
+                      <Badge variant={trade.status === "OPEN" ? "accent" : "neutral"}>{trade.status}</Badge>
+                      {trade.exit_reason === "RESOLVED" && (
+                        <span className="ml-1 text-[10px] text-muted">{t("paper.settled")}</span>
+                      )}
+                    </Td>
+                    <Td className="text-xs">
+                      <ShadowCell trade={trade} />
+                    </Td>
                     <Td>
                       {trade.status === "OPEN" && (
                         <Button size="sm" variant="outline" onClick={() => closeTrade(trade.paper_trade_id)} disabled={closing === trade.paper_trade_id}>
-                          {closing === trade.paper_trade_id ? t("paper.closing") : t("paper.closeAtMkt")}
+                          {closing === trade.paper_trade_id ? t("paper.closing") : t("paper.closeAtBid")}
                         </Button>
                       )}
                     </Td>
@@ -137,6 +149,28 @@ export default function PaperTradesPage() {
           </Table>
         </DataState>
       </Card>
+    </div>
+  );
+}
+
+function pct(value: number) {
+  return `${Math.round(value * 100)}%`;
+}
+
+function ShadowCell({ trade }: { trade: PaperTrade }) {
+  const { t } = useI18n();
+  const shadow = trade.shadow;
+  if (trade.status !== "OPEN" || !shadow) return <span className="text-muted">—</span>;
+  const target = shadow.target_fraction ?? 1;
+  return (
+    <div className="flex flex-wrap items-center gap-1" title={t("paper.shadowTooltip")}>
+      <Badge variant={target < 1 ? "warn" : "outline"}>{t("paper.shadowHold", { pct: pct(target) })}</Badge>
+      {shadow.retention != null && (
+        <span className="tabular-nums text-muted">{t("paper.shadowRetention", { pct: pct(shadow.retention) })}</span>
+      )}
+      {shadow.triggers.map((trigger) => (
+        <span key={trigger} className="text-[10px] text-muted">{trigger}</span>
+      ))}
     </div>
   );
 }

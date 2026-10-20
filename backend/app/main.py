@@ -1,8 +1,9 @@
 """FastAPI application factory.
 
 Safety notes:
-- The scheduler (if enabled) only triggers the scanner. There is NO scheduled path to
-  order submission (development-rules.md #1).
+- The scheduler (if enabled) only triggers the scanner and the position monitor (which
+  can only settle PAPER trades). There is NO scheduled path to order submission
+  (development-rules.md #1).
 - CORS is restricted to CORS_ORIGINS (default: localhost:3000).
 """
 from __future__ import annotations
@@ -43,7 +44,7 @@ def create_app(settings: Settings | None = None, container: Container | None = N
         app.state.container = container or Container(settings, get_session_factory())
         app.state.scheduler_running = False
         scheduler = None
-        if settings.scanner_interval_minutes > 0:
+        if settings.scanner_interval_minutes > 0 or settings.position_monitor_interval_minutes > 0:
             from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
             scheduler = AsyncIOScheduler()
@@ -55,11 +56,27 @@ def create_app(settings: Settings | None = None, container: Container | None = N
                     return  # a scan is already running — skip this tick
                 await app.state.container.scanner.run_scan(state.scan_id)
 
-            scheduler.add_job(scheduled_scan, "interval",
-                              minutes=settings.scanner_interval_minutes)
+            async def scheduled_monitor() -> None:
+                monitor = app.state.container.position_monitor
+                if monitor.running:
+                    return  # previous pass still running — skip this tick
+                try:
+                    await monitor.run_once()
+                except Exception:
+                    logger.exception("scheduled position monitor pass failed")
+
+            if settings.scanner_interval_minutes > 0:
+                scheduler.add_job(scheduled_scan, "interval",
+                                  minutes=settings.scanner_interval_minutes)
+                logger.info("scanner scheduled every %s minutes",
+                            settings.scanner_interval_minutes)
+            if settings.position_monitor_interval_minutes > 0:
+                scheduler.add_job(scheduled_monitor, "interval",
+                                  minutes=settings.position_monitor_interval_minutes)
+                logger.info("position monitor scheduled every %s minutes",
+                            settings.position_monitor_interval_minutes)
             scheduler.start()
             app.state.scheduler_running = True
-            logger.info("scanner scheduled every %s minutes", settings.scanner_interval_minutes)
         if settings.enable_live_trading:
             logger.warning("ENABLE_LIVE_TRADING=true — live order submission is ACTIVE. "
                            "Review /docs/risk-control.md.")

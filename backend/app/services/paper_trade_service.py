@@ -2,7 +2,9 @@
 
 Accounting (api-contract §9): shares = notional / entry_price (frozen at entry);
 pnl = shares * (exit_price - entry_price). Auto entries use the side's best ask at
-signal time (ASSUMPTION-A9) so paper fills are honest taker prices.
+signal time (ASSUMPTION-A9) so paper fills are honest taker prices; open positions are
+marked, and by default closed, at the side's best BID (A24) — the price a sale would
+actually get — never the midpoint. Settled markets close at the official payout (A25).
 
 Auto-log guards (ASSUMPTION-A9b): extreme-price signals and signals whose relative
 spread (spread / entry price) exceeds PAPER_TRADE_MAX_RELATIVE_SPREAD are NOT
@@ -19,13 +21,59 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import NotFoundError, ValidationFailed
-from app.models import Market, MarketSnapshot, PaperTrade
+from app.models import Market, MarketSnapshot, PaperTrade, PositionObservation
+from app.services.exit_rules import mark_price_from_snapshot
 
 EXTREME_PRICE_FLAG = "EXTREME_PRICE"
+
+EXIT_REASON_MANUAL = "MANUAL"
+EXIT_REASON_RESOLVED = "RESOLVED"
+
+MARK_BASIS_BID = "BID"
+MARK_BASIS_MIDPOINT = "MIDPOINT"  # fallback only when no bid was ever recorded
 
 
 def _utcnow() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
+
+
+@dataclass(frozen=True)
+class MarkQuote:
+    price: float
+    basis: str  # BID / MIDPOINT
+    as_of: datetime
+
+
+def snapshot_side_price(snap: MarketSnapshot, direction: str, side: str) -> float | None:
+    """Per-side best bid/ask from a snapshot (older snapshots only carry YES columns)."""
+    if side == "bid":
+        return mark_price_from_snapshot(snap.orderbook_depth, snap.best_bid, direction)
+    book = (snap.orderbook_depth or {}).get("yes" if direction == "YES" else "no") or {}
+    ask = book.get("best_ask")
+    if ask is None and direction == "YES":
+        ask = snap.best_ask
+    return float(ask) if ask is not None else None
+
+
+def pick_mark(*, direction: str, snapshot: MarketSnapshot | None,
+              observation: PositionObservation | None) -> MarkQuote | None:
+    """Newest best bid among the latest market snapshot and the latest position-monitor
+    observation; midpoint only if neither has a bid (flagged as such)."""
+    candidates: list[MarkQuote] = []
+    if observation is not None and observation.best_bid is not None:
+        candidates.append(MarkQuote(observation.best_bid, MARK_BASIS_BID,
+                                    observation.observed_at))
+    if snapshot is not None:
+        bid = snapshot_side_price(snapshot, direction, "bid")
+        if bid is not None:
+            candidates.append(MarkQuote(bid, MARK_BASIS_BID, snapshot.snapshot_time))
+    if candidates:
+        return max(candidates, key=lambda q: q.as_of)
+    if snapshot is not None:
+        mid = snapshot.yes_price if direction == "YES" else snapshot.no_price
+        if mid is not None:
+            return MarkQuote(mid, MARK_BASIS_MIDPOINT, snapshot.snapshot_time)
+    return None
 
 
 @dataclass(frozen=True)
@@ -83,20 +131,39 @@ class PaperTradeService:
         await session.flush()
         return trade
 
-    async def latest_price(self, session: AsyncSession, market_id: int,
-                           direction: str) -> float | None:
-        snap = (await session.execute(
+    async def latest_snapshot(self, session: AsyncSession,
+                              market_id: int) -> MarketSnapshot | None:
+        return (await session.execute(
             select(MarketSnapshot).where(MarketSnapshot.market_id == market_id)
             .order_by(MarketSnapshot.snapshot_time.desc()).limit(1))).scalar_one_or_none()
+
+    async def latest_observation(self, session: AsyncSession,
+                                 trade_id: int) -> PositionObservation | None:
+        return (await session.execute(
+            select(PositionObservation).where(PositionObservation.paper_trade_id == trade_id)
+            .order_by(PositionObservation.observed_at.desc()).limit(1))).scalar_one_or_none()
+
+    async def latest_entry_price(self, session: AsyncSession, market_id: int,
+                                 direction: str) -> float | None:
+        """Default manual entry = the side's best ask (a buy pays the ask, A9)."""
+        snap = await self.latest_snapshot(session, market_id)
         if snap is None:
             return None
+        ask = snapshot_side_price(snap, direction, "ask")
+        if ask is not None:
+            return ask
         return snap.yes_price if direction == "YES" else snap.no_price
+
+    async def latest_mark(self, session: AsyncSession, trade: PaperTrade) -> MarkQuote | None:
+        return pick_mark(direction=trade.direction,
+                         snapshot=await self.latest_snapshot(session, trade.market_id),
+                         observation=await self.latest_observation(session, trade.id))
 
     async def create_manual(self, session: AsyncSession, *, market_row: Market,
                             direction: str, notional: float, entry_price: float | None,
                             signal_id: str | None) -> PaperTrade:
         if entry_price is None:
-            entry_price = await self.latest_price(session, market_row.id, direction)
+            entry_price = await self.latest_entry_price(session, market_row.id, direction)
         if entry_price is None:
             raise ValidationFailed(
                 "entry_price not provided and no snapshot price available for this market")
@@ -121,15 +188,31 @@ class PaperTradeService:
         if trade.status != "OPEN":
             raise ValidationFailed(f"paper trade is {trade.status}, only OPEN can be closed")
         if exit_price is None:
-            exit_price = await self.latest_price(session, trade.market_id, trade.direction)
+            mark = await self.latest_mark(session, trade)
+            exit_price = mark.price if mark is not None else None
         if exit_price is None:
             raise ValidationFailed(
                 "exit_price not provided and no snapshot price available for this market")
         if not (0 <= exit_price <= 1):
             raise ValidationFailed("exit_price must be within [0, 1]")
-        trade.exit_price = exit_price
-        trade.exit_time = _utcnow()
-        trade.pnl = round(trade.shares * (exit_price - trade.entry_price), 4)
-        trade.status = "CLOSED"
+        self._finalize(trade, exit_price, _utcnow(), EXIT_REASON_MANUAL)
         await session.flush()
         return trade
+
+    def settle(self, trade: PaperTrade, payout: float, settled_at: datetime) -> PaperTrade:
+        """Close an OPEN trade at the official resolution payout (A25). Idempotent."""
+        if trade.status != "OPEN":
+            return trade
+        if not (0 <= payout <= 1):
+            raise ValidationFailed("settlement payout must be within [0, 1]")
+        self._finalize(trade, payout, settled_at, EXIT_REASON_RESOLVED)
+        return trade
+
+    @staticmethod
+    def _finalize(trade: PaperTrade, exit_price: float, exit_time: datetime,
+                  reason: str) -> None:
+        trade.exit_price = exit_price
+        trade.exit_time = exit_time
+        trade.pnl = round(trade.shares * (exit_price - trade.entry_price), 4)
+        trade.status = "CLOSED"
+        trade.exit_reason = reason

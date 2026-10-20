@@ -179,6 +179,8 @@ class FakeDataClient(DataClient):
 
     async def get_positions(self, user: str, *, condition_id: str | None = None,
                             **kwargs: Any) -> list[dict[str, Any]]:
+        if user.lower() in self.dataset.get("positions_fail", ()):
+            raise UpstreamError("positions unavailable")
         return self.dataset["positions"].get((user.lower(), condition_id), [])
 
     async def get_closed_positions(self, user: str, *, max_pages: int = 4

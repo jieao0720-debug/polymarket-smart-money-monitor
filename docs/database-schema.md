@@ -172,6 +172,42 @@ SQLAlchemy 2.0；本地 SQLite / 生产 PostgreSQL。所有表带自增整型主
 | pnl | float NULL（= shares*(exit−entry)） |
 | status | str OPEN/CLOSED/CANCELLED INDEX |
 | source | str AUTO_SIGNAL / MANUAL |
+| exit_reason | str NULL（MANUAL 手动平仓 / RESOLVED 按官方结算入账，A25） |
+
+### 9b. paper_trade_cohort（入场跟随名单，A26）
+
+| 列 | 类型 |
+| --- | --- |
+| id | int PK |
+| paper_trade_id | FK paper_trades INDEX |
+| wallet_address | str（UNIQUE 与 paper_trade_id 组合） |
+| direction | str（所买方向） |
+| entry_shares / entry_opposite_shares | float（入场时本方向 / 反方向份额） |
+| entry_net_exposure | float（e_0，> 0） |
+| entry_value | float（入场时本方向持仓价值，权重基数） |
+| weight | float（同一仓位合计 1） |
+| smart_money_score / label | 入场时评分与标签 |
+| source | str ENTRY / BACKFILL |
+| signal_snapshot_time | datetime（入场信号快照时间） |
+| created_at | datetime |
+
+### 9c. position_observations（持仓监控观察，A27；影子模式，只记录）
+
+| 列 | 类型 |
+| --- | --- |
+| id | int PK |
+| paper_trade_id | FK INDEX；(paper_trade_id, observed_at) INDEX |
+| observed_at | datetime INDEX |
+| market_status | str OPEN / AWAITING_RESOLUTION / RESOLVED / UNKNOWN |
+| best_bid / best_ask | float NULL（持有方向） |
+| liquidation_price / liquidation_value / liquidation_fill_ratio / liquidation_return | float NULL（按买盘逐档卖出整笔仓位，扣费；未成交部分不计价值） |
+| retention / coverage | float NULL（R 与已知权重合计） |
+| cohort_detail | JSON（每个账户 e_0、e_t、HOLDING/REDUCED/EXITED/REVERSED/UNKNOWN） |
+| latest_signal_direction / latest_signal_time | 入场后最新扫描信号 |
+| shadow_state | JSON（各规则连续计数 streaks、首次触发时间 fired_at） |
+| shadow_triggers | JSON NULL（本轮确认的规则） |
+| shadow_target_fraction | float（影子目标仓位比例，只降不升） |
+| data_issues | JSON NULL（数据缺失说明） |
 
 ## 10. wallet_connections
 
@@ -208,5 +244,12 @@ markets 1─n market_holders n─1 accounts
 markets 1─n account_labels n─1 accounts
 accounts 1─n account_resolved_stats
 markets 1─n smart_money_signals 1─n paper_trades(逻辑FK signal_uid)
+paper_trades 1─n paper_trade_cohort
+paper_trades 1─n position_observations
 markets 1─n trade_tickets
 ```
+
+## 增量迁移
+
+仍不引入 Alembic（A10）。`init_db` 在 `create_all` 之后，为已有表补齐模型中新增的**可空**列
+（`ALTER TABLE ... ADD COLUMN`，可重复执行）；非空列或类型变更仍需正式迁移。

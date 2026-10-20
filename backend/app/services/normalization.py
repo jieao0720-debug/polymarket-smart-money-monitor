@@ -143,6 +143,8 @@ class NormalizedMarket:
     spread_hint: float | None  # gamma `spread` field
     best_bid_hint: float | None
     best_ask_hint: float | None
+    uma_resolution_status: str | None = None  # e.g. "resolved" (UNCERTAINTY-U14)
+    closed_time: datetime | None = None
 
     @property
     def token_directions(self) -> dict[str, str]:
@@ -202,6 +204,9 @@ def normalize_market(raw: dict[str, Any]) -> NormalizedMarket:
         spread_hint=_to_float(raw.get("spread")),
         best_bid_hint=_to_float(raw.get("bestBid")),
         best_ask_hint=_to_float(raw.get("bestAsk")),
+        uma_resolution_status=(str(raw["umaResolutionStatus"]).strip().lower()
+                               if raw.get("umaResolutionStatus") else None),
+        closed_time=parse_dt(raw.get("closedTime")),
     )
 
 
@@ -218,6 +223,7 @@ class NormalizedBook:
     ask_depth_usdc: float
     top3_ask_usdc: float
     one_sided: bool
+    bids: list[tuple[float, float]] = field(default_factory=list)  # (price, size), best first
 
 
 def normalize_book(raw: dict[str, Any], token_id: str) -> NormalizedBook:
@@ -248,6 +254,7 @@ def normalize_book(raw: dict[str, Any], token_id: str) -> NormalizedBook:
         ask_depth_usdc=round(sum(p * s for p, s in asks), 2),
         top3_ask_usdc=round(sum(p * s for p, s in top3_asks), 2),
         one_sided=(best_bid is None) != (best_ask is None),
+        bids=sorted(bids, key=lambda x: x[0], reverse=True),
     )
 
 
