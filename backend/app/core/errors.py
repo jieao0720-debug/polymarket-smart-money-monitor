@@ -70,6 +70,12 @@ class UpstreamError(AppError):
     code = "UPSTREAM_ERROR"
 
 
+class ConflictError(AppError):
+    """A concurrent write changed the row this request read; retry on the fresh state."""
+    status_code = 409
+    code = "CONFLICT"
+
+
 class ScanAlreadyRunningError(AppError):
     status_code = 409
     code = "SCAN_ALREADY_RUNNING"

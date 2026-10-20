@@ -36,11 +36,17 @@ def make_test_settings(**overrides: Any) -> Settings:
 
 def build_test_app(settings: Settings, dataset: dict[str, Any] | None = None,
                    *, geoblock_fail: bool = False,
-                   rpc: fakes.FakeRpcClient | None = None):
-    """App + container wired with fake clients over an in-memory sqlite DB."""
+                   rpc: fakes.FakeRpcClient | None = None,
+                   database_url: str | None = None):
+    """App + container wired with fake clients over an in-memory sqlite DB (one shared
+    connection), or over `database_url` with a real pool — needed by concurrency tests,
+    where every session must own its connection and transaction like in production."""
     dataset = dataset or fakes.default_dataset()
-    engine = create_async_engine("sqlite+aiosqlite://", poolclass=StaticPool,
-                                 connect_args={"check_same_thread": False})
+    if database_url is None:
+        engine = create_async_engine("sqlite+aiosqlite://", poolclass=StaticPool,
+                                     connect_args={"check_same_thread": False})
+    else:
+        engine = create_async_engine(database_url)
     factory = async_sessionmaker(engine, expire_on_commit=False)
     session_module.reset_engine_for_tests(engine, factory)
 

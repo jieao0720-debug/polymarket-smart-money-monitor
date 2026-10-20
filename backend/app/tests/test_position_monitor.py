@@ -604,3 +604,129 @@ class TestReviewRegressions:
                                                      abs=1e-6)
         exits = _observations(client, trade["paper_trade_id"])["exits"]
         assert [x["reason"] for x in exits] == ["MANUAL", "RESOLVED"]
+
+
+# ----------------------------------------------------------------- regressions (review 9c6fbce)
+
+@pytest.fixture
+def file_db_bundle(tmp_path):
+    from fastapi.testclient import TestClient
+
+    from app.tests.conftest import build_test_app, make_test_settings
+
+    app, container, dataset = build_test_app(
+        make_test_settings(), database_url=f"sqlite+aiosqlite:///{tmp_path / 'race.db'}")
+    with TestClient(app) as client:
+        yield client, container, dataset
+
+
+def _ledger(client, trade_id):
+    """(trade row as listed, Σ exit shares, Σ exit pnl)."""
+    trade = next(t for t in client.get("/api/paper-trades").json()["paper_trades"]
+                 if t["paper_trade_id"] == trade_id)
+    exits = _observations(client, trade_id)["exits"]
+    return trade, sum(x["shares"] for x in exits), sum(x["pnl"] for x in exits)
+
+
+class TestConcurrentExits:
+    def test_two_simultaneous_closes_never_oversell(self, file_db_bundle):
+        import asyncio
+
+        import httpx
+
+        client, container, _ = file_db_bundle
+        run_scan_and_wait(client)
+        opened = _open_trade(client)
+        url = f"/api/paper-trades/{opened['paper_trade_id']}/close"
+        real_get_book = container.clob.get_book
+
+        async def race():
+            both_in = asyncio.Event()
+            arrived = 0
+
+            async def gated_get_book(token_id):
+                # Both requests have read the OPEN trade before either may proceed.
+                nonlocal arrived
+                arrived += 1
+                if arrived == 2:
+                    both_in.set()
+                await asyncio.wait_for(both_in.wait(), 5)
+                return await real_get_book(token_id)
+
+            container.clob.get_book = gated_get_book
+            try:
+                transport = httpx.ASGITransport(app=client.app)
+                async with httpx.AsyncClient(transport=transport,
+                                             base_url="http://test") as ac:
+                    return await asyncio.gather(ac.post(url, json={}),
+                                                ac.post(url, json={}))
+            finally:
+                del container.clob.get_book
+
+        responses = client.portal.call(race)
+        codes = sorted(r.status_code for r in responses)
+        assert codes[0] == 200 and codes[1] in (409, 422), [r.text for r in responses]
+        trade, exited, fill_pnl = _ledger(client, opened["paper_trade_id"])
+        assert trade["status"] == "CLOSED"
+        assert exited == pytest.approx(opened["shares"])
+        assert fill_pnl == pytest.approx(trade["pnl"], abs=1e-3)
+
+    def test_stale_exit_is_refused_not_booked_twice(self, file_db_bundle):
+        from sqlalchemy import select
+
+        from app.core.errors import ConflictError
+        from app.models import PaperTrade
+
+        client, container, _ = file_db_bundle
+        run_scan_and_wait(client)
+        opened = _open_trade(client)
+        svc = container.paper_trades
+
+        async def race() -> None:
+            factory = container.session_factory
+            async with factory() as s1, factory() as s2:
+                t1 = (await s1.execute(select(PaperTrade))).scalar_one()
+                t2 = (await s2.execute(select(PaperTrade))).scalar_one()  # same snapshot
+                await svc.record_exit(s1, t1, shares=t1.open_shares, price=0.5,
+                                      at=fakes.now_utc(), reason="MANUAL")
+                await s1.commit()
+                with pytest.raises(ConflictError):
+                    await svc.record_exit(s2, t2, shares=t2.open_shares, price=0.5,
+                                          at=fakes.now_utc(), reason="MANUAL")
+                await s2.rollback()
+
+        client.portal.call(race)
+        trade, exited, fill_pnl = _ledger(client, opened["paper_trade_id"])
+        assert trade["status"] == "CLOSED"
+        assert exited == pytest.approx(opened["shares"])
+        assert fill_pnl == pytest.approx(trade["pnl"], abs=1e-3)
+
+    def test_settlement_after_concurrent_partial_close_books_only_the_rest(
+            self, file_db_bundle):
+        from sqlalchemy import select
+
+        from app.models import PaperTrade
+
+        client, container, _ = file_db_bundle
+        run_scan_and_wait(client)
+        opened = _open_trade(client)
+        svc = container.paper_trades
+        half = opened["shares"] / 2
+
+        async def race() -> None:
+            factory = container.session_factory
+            async with factory() as monitor, factory() as manual:
+                stale = (await monitor.execute(select(PaperTrade))).scalar_one()
+                t = (await manual.execute(select(PaperTrade))).scalar_one()
+                await svc.record_exit(manual, t, shares=half, price=0.5,
+                                      at=fakes.now_utc(), reason="MANUAL")
+                await manual.commit()
+                # The monitor still holds the pre-close copy; settle must re-read it.
+                await svc.settle(monitor, stale, 1.0, fakes.now_utc())
+                await monitor.commit()
+
+        client.portal.call(race)
+        trade, exited, fill_pnl = _ledger(client, opened["paper_trade_id"])
+        assert trade["status"] == "CLOSED" and trade["exit_reason"] == "RESOLVED"
+        assert exited == pytest.approx(opened["shares"])
+        assert fill_pnl == pytest.approx(trade["pnl"], abs=1e-3)

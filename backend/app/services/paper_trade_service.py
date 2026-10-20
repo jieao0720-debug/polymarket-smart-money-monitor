@@ -3,7 +3,11 @@
 Accounting (api-contract §9): shares = notional / entry_price (frozen at entry).
 Exits are recorded as paper_trade_exits fills; pnl = Σ fill proceeds − exited shares ×
 entry_price (realized so far), remaining_shares = shares still held, and the trade is
-CLOSED once nothing remains (exit_price = average net exit price). Auto entries use the
+CLOSED once nothing remains (exit_price = average net exit price). Every exit — manual
+close or settlement — goes through record_exit, which books the fill and decrements the
+held shares in one transaction guarded by a compare-and-swap on those shares, so two
+concurrent exits can never sell the same shares twice (the loser gets ConflictError).
+Auto entries use the
 side's best ask at signal time (ASSUMPTION-A9) so paper fills are honest taker prices;
 open positions are marked at the side's best BID, and a default close sells into the
 live bid ladder net of fees — only what the book can absorb is filled (A24). Settled
@@ -20,10 +24,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select, update
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
 
-from app.core.errors import NotFoundError, ValidationFailed
+from app.core.errors import ConflictError, NotFoundError, ValidationFailed
 from app.models import Market, MarketSnapshot, PaperTrade, PaperTradeExit, PositionObservation
 from app.services.exit_rules import liquidation_quote, mark_price_from_snapshot
 
@@ -191,8 +197,11 @@ class PaperTradeService:
         Otherwise sell the remaining shares into `bids` (the live ladder, best first) net of
         fees; only what the book absorbs is filled and the rest stays OPEN. No book or no
         bids → refused: a fill that cannot be verified is never recorded."""
-        trade = (await session.execute(select(PaperTrade).where(
-            PaperTrade.trade_uid == trade_uid))).scalar_one_or_none()
+        # Fresh read (the identity map may hold a copy loaded before an await); FOR UPDATE
+        # locks the row on server databases, SQLite relies on record_exit's CAS.
+        trade = (await session.execute(
+            select(PaperTrade).where(PaperTrade.trade_uid == trade_uid).with_for_update()
+            .execution_options(populate_existing=True))).scalar_one_or_none()
         if trade is None:
             raise NotFoundError(f"paper trade {trade_uid} not found")
         if trade.status != "OPEN":
@@ -218,6 +227,8 @@ class PaperTradeService:
     async def settle(self, session: AsyncSession, trade: PaperTrade, payout: float,
                      settled_at: datetime) -> PaperTrade:
         """Close what remains of an OPEN trade at the official payout (A25). Idempotent."""
+        # The monitor loaded `trade` before its network calls; re-read what is held now.
+        await session.refresh(trade, with_for_update=True)
         if trade.status != "OPEN":
             return trade
         if not (0 <= payout <= 1):
@@ -229,23 +240,51 @@ class PaperTradeService:
     async def record_exit(self, session: AsyncSession, trade: PaperTrade, *, shares: float,
                           price: float, at: datetime, reason: str,
                           fee: float = 0.0) -> PaperTradeExit:
-        remaining = trade.open_shares
-        shares = min(shares, remaining)
+        """Book one exit fill. The trade row is updated only if it is still OPEN and still
+        holds exactly the shares this session read (compare-and-swap), in the same
+        transaction as the fill insert. A concurrent exit that got there first makes this
+        one fail with ConflictError — nothing is booked — instead of selling the same
+        shares twice. The caller must roll back on any error."""
+        if trade.status != "OPEN":
+            raise ConflictError(f"paper trade is {trade.status}, nothing left to exit")
+        held = trade.open_shares
+        shares = min(shares, held)
+        if shares <= 0:
+            raise ValidationFailed("no open shares left to exit")
         proceeds = shares * price
+        fill_pnl = proceeds - shares * trade.entry_price
+        left = held - shares
+        remaining = 0.0 if left <= 1e-9 else round(left, 6)
+        pnl = round((trade.pnl or 0.0) + fill_pnl, 4)
+        changes: dict[str, object] = {"remaining_shares": remaining, "pnl": pnl}
+        if remaining == 0.0:
+            exited = trade.shares
+            total_proceeds = pnl + exited * trade.entry_price
+            changes.update(
+                exit_price=round(total_proceeds / exited, 6) if exited > 0 else price,
+                exit_time=at, exit_reason=reason, status="CLOSED")
+        try:
+            result = await session.execute(
+                update(PaperTrade)
+                .where(PaperTrade.id == trade.id, PaperTrade.status == "OPEN",
+                       func.coalesce(PaperTrade.remaining_shares, PaperTrade.shares) == held)
+                .values(**changes)
+                .execution_options(synchronize_session=False))
+        except OperationalError as exc:
+            # SQLite answers a write-write race with "database is locked" (SQLITE_BUSY).
+            if "locked" not in str(exc).lower():
+                raise
+            raise ConflictError("paper trade is being exited concurrently — retry") from exc
+        if result.rowcount != 1:
+            raise ConflictError(
+                "paper trade changed concurrently (another exit was booked) — reload and "
+                "retry")
+        for key, value in changes.items():
+            set_committed_value(trade, key, value)
         fill = PaperTradeExit(
             paper_trade_id=trade.id, exit_time=at, shares=round(shares, 6),
             price=round(price, 6), proceeds=round(proceeds, 6), fee=round(fee, 6),
-            reason=reason, pnl=round(proceeds - shares * trade.entry_price, 6))
+            reason=reason, pnl=round(fill_pnl, 6))
         session.add(fill)
-        left = remaining - shares
-        trade.remaining_shares = 0.0 if left <= 1e-9 else round(left, 6)
-        trade.pnl = round((trade.pnl or 0.0) + proceeds - shares * trade.entry_price, 4)
-        if trade.remaining_shares == 0.0:
-            exited = trade.shares
-            total_proceeds = trade.pnl + exited * trade.entry_price
-            trade.exit_price = round(total_proceeds / exited, 6) if exited > 0 else price
-            trade.exit_time = at
-            trade.exit_reason = reason
-            trade.status = "CLOSED"
         await session.flush()
         return fill

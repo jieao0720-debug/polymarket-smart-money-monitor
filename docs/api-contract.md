@@ -11,7 +11,7 @@ Base: `http://localhost:8000`。所有响应 JSON。时间一律 ISO-8601 UTC（
 
 常用 code：`VALIDATION_ERROR`(422) `NOT_FOUND`(404) `GEOBLOCKED`(403) `CLOSE_ONLY_REGION`(403)
 `LIVE_TRADING_DISABLED`(403) `RISK_CHECK_FAILED`(400) `MARKET_NOT_TRADABLE`(400) `UPSTREAM_ERROR`(502)
-`SCAN_ALREADY_RUNNING`(409) `INTERNAL_ERROR`(500)。
+`SCAN_ALREADY_RUNNING`(409) `CONFLICT`(409) `INTERNAL_ERROR`(500)。
 
 许多读取端点带 `warnings: string[]`，表示 partial data（上游部分失败但不致命）。
 
@@ -198,6 +198,8 @@ Query：`status` `market_id` `limit` `offset`。
 Body: `{ "exit_price": 0.8 }`。缺省时读取实时盘口，把剩余份额逐档卖给买盘并扣 `PAPER_EXIT_FEE_BPS`（A24）：
 买盘承接不了的份额保持 OPEN（`remaining_shares` > 0）；拿不到盘口或没有买盘返回 422，不记录成交。
 指定 `exit_price` 视为用户声明的成交，按该价格平掉全部剩余份额。Response：更新后的 PaperTrade。
+同一仓位的平仓（或结算）并发进行时，只有先入账的一笔成功，另一笔返回 409 `CONFLICT`、不记录成交；
+重新读取仓位后可重试（仓位已 CLOSED 时返回 422）。
 
 ### 10c. POST /api/paper-trades/monitor/run
 
