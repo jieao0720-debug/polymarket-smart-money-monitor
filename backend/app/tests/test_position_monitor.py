@@ -1,14 +1,26 @@
 """Settlement, bid-side marking, entry cohort and SHADOW exit observations (A24–A27)."""
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timedelta
+from functools import partial
 
+import httpx
 import pytest
-from sqlalchemy import create_engine, inspect, text
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, inspect, select, text
 
+from app.core.errors import ConflictError
 from app.db.init_db import add_missing_nullable_columns
-from app.models import MarketSnapshot, PaperTradeCohortMember, PositionObservation
+from app.models import (
+    Market,
+    MarketSnapshot,
+    PaperTrade,
+    PaperTradeCohortMember,
+    PositionObservation,
+    SmartMoneySignal,
+)
 from app.services.exit_rules import (
     MARKET_AWAITING_RESOLUTION,
     MARKET_OPEN,
@@ -28,7 +40,7 @@ from app.services.exit_rules import (
 from app.services.normalization import normalize_market
 from app.services.paper_trade_service import MARK_BASIS_BID, MARK_BASIS_MIDPOINT, pick_mark
 from app.tests import fakes
-from app.tests.conftest import run_scan_and_wait
+from app.tests.conftest import build_test_app, make_test_settings, run_scan_and_wait
 
 NOW = datetime(2026, 10, 20, 12, 0, 0)
 
@@ -421,15 +433,10 @@ def test_add_missing_nullable_columns_on_legacy_table():
 # ----------------------------------------------------------------- regressions (review 96aa677)
 
 def _monitor_at(client, container, when):
-    from functools import partial
     return client.portal.call(partial(container.position_monitor.run_once, now=when))
 
 
 def _add_signal(client, container, direction, at):
-    from sqlalchemy import select
-
-    from app.models import Market, SmartMoneySignal
-
     async def add() -> None:
         async with container.session_factory() as session:
             market = (await session.execute(select(Market))).scalars().first()
@@ -610,10 +617,6 @@ class TestReviewRegressions:
 
 @pytest.fixture
 def file_db_bundle(tmp_path):
-    from fastapi.testclient import TestClient
-
-    from app.tests.conftest import build_test_app, make_test_settings
-
     app, container, dataset = build_test_app(
         make_test_settings(), database_url=f"sqlite+aiosqlite:///{tmp_path / 'race.db'}")
     with TestClient(app) as client:
@@ -630,10 +633,6 @@ def _ledger(client, trade_id):
 
 class TestConcurrentExits:
     def test_two_simultaneous_closes_never_oversell(self, file_db_bundle):
-        import asyncio
-
-        import httpx
-
         client, container, _ = file_db_bundle
         run_scan_and_wait(client)
         opened = _open_trade(client)
@@ -672,11 +671,6 @@ class TestConcurrentExits:
         assert fill_pnl == pytest.approx(trade["pnl"], abs=1e-3)
 
     def test_stale_exit_is_refused_not_booked_twice(self, file_db_bundle):
-        from sqlalchemy import select
-
-        from app.core.errors import ConflictError
-        from app.models import PaperTrade
-
         client, container, _ = file_db_bundle
         run_scan_and_wait(client)
         opened = _open_trade(client)
@@ -703,10 +697,6 @@ class TestConcurrentExits:
 
     def test_settlement_after_concurrent_partial_close_books_only_the_rest(
             self, file_db_bundle):
-        from sqlalchemy import select
-
-        from app.models import PaperTrade
-
         client, container, _ = file_db_bundle
         run_scan_and_wait(client)
         opened = _open_trade(client)
@@ -740,10 +730,6 @@ class TestSettlementObservations:
     @pytest.mark.parametrize("close_all", [False, True])
     def test_monitor_uses_actual_settlement_after_manual_close(
             self, file_db_bundle, monkeypatch, payout, fee_bps, close_all):
-        import asyncio
-
-        import httpx
-
         client, container, dataset = file_db_bundle
         run_scan_and_wait(client)
         opened = _open_trade(client)
@@ -814,9 +800,6 @@ class TestSettlementObservations:
     @pytest.mark.parametrize("resolved", [False, True])
     def test_failed_market_rolls_back_counts_and_continues(
             self, file_db_bundle, monkeypatch, resolved):
-        from app.core.errors import ConflictError
-        from app.models import Market
-
         client, container, dataset = file_db_bundle
         run_scan_and_wait(client)
         opened = _open_trade(client)
