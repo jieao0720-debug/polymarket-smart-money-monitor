@@ -76,5 +76,8 @@ class MarketHolder(Base):
     entry_notional_approx: Mapped[float | None] = mapped_column(Float, nullable=True)  # U3
     rank: Mapped[int] = mapped_column(Integer)
     value_is_approx: Mapped[bool] = mapped_column(Boolean, default=False)  # U4
+    # Shares the account holds on the OTHER side of this market, from its full /positions
+    # (not the other side's top-20). NULL = lookup failed or row predates 2026-10-20.
+    opposite_shares: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     __table_args__ = (Index("ix_holders_market_time", "market_id", "snapshot_time"),)

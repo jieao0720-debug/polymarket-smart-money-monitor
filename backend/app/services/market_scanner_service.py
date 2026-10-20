@@ -304,7 +304,8 @@ class MarketScannerService:
                 current_position_value=holder.current_position_value,
                 average_price=holder.average_price, current_price=holder.current_price,
                 entry_notional_approx=holder.entry_notional_approx,
-                rank=holder.rank, value_is_approx=holder.value_is_approx))
+                rank=holder.rank, value_is_approx=holder.value_is_approx,
+                opposite_shares=holder.opposite_shares))
 
             cat = market.category
             cat_stats = holder.stats.category_stats(cat)
@@ -321,7 +322,8 @@ class MarketScannerService:
 
             session.add(AccountLabel(
                 account_id=account.id, market_id=market_row.id, snapshot_time=now,
-                label=assessment.label, anomaly_index=assessment.anomaly_index,
+                direction=holder.direction, label=assessment.label,
+                anomaly_index=assessment.anomaly_index,
                 smart_money_score=assessment.smart_money_score,
                 score_breakdown=assessment.score_breakdown, reason=assessment.reason))
 

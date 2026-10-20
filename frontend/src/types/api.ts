@@ -236,9 +236,10 @@ export interface PaperTrade {
   entry_time: string;
   notional: number;
   shares: number;
-  exit_price: number | null;
+  remaining_shares?: number | null; // still held after partial exits
+  exit_price: number | null; // average net exit price once fully closed
   exit_time: string | null;
-  pnl: number | null;
+  pnl: number | null; // realized so far, partial exits included
   unrealized_pnl: number | null;
   current_price: number | null; // side best bid
   price_basis?: "BID" | "MIDPOINT" | null;

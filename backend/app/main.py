@@ -29,7 +29,7 @@ from app.core.config import Settings, get_settings
 from app.core.errors import register_error_handlers
 from app.core.logging_utils import configure_logging
 from app.db.init_db import init_db
-from app.db.session import get_session_factory
+from app.db.session import get_engine, get_session_factory
 
 logger = logging.getLogger("app.main")
 
@@ -84,6 +84,7 @@ def create_app(settings: Settings | None = None, container: Container | None = N
         if scheduler is not None:
             scheduler.shutdown(wait=False)
         await app.state.container.aclose()
+        await get_engine().dispose()  # close pooled DB connections on this event loop
 
     app = FastAPI(title=settings.app_name, version=settings.version, lifespan=lifespan,
                   docs_url="/api/docs", openapi_url="/api/openapi.json")

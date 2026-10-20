@@ -5,12 +5,13 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import Container, get_container, get_db
-from app.core.errors import NotFoundError
+from app.core.errors import NotFoundError, UpstreamError
 from app.models import (
     Market,
     MarketSnapshot,
     PaperTrade,
     PaperTradeCohortMember,
+    PaperTradeExit,
     PositionObservation,
 )
 from app.schemas.api import (
@@ -19,12 +20,14 @@ from app.schemas.api import (
     PaperTradeCloseRequest,
     PaperTradeCreateRequest,
     PaperTradeEntry,
+    PaperTradeExitEntry,
     PaperTradesResponse,
     PaperTradeSummary,
     PositionObservationEntry,
     PositionObservationsResponse,
     ShadowExitSummary,
 )
+from app.services.normalization import normalize_book
 from app.services.paper_trade_service import pick_mark
 
 router = APIRouter(prefix="/api/paper-trades", tags=["paper-trades"])
@@ -63,7 +66,7 @@ def _to_entry(trade: PaperTrade, market: Market, snap: MarketSnapshot | None,
         mark = pick_mark(direction=trade.direction, snapshot=snap, observation=obs)
         if mark is not None:
             current_price, basis, as_of = mark.price, mark.basis, mark.as_of
-            unrealized = round(trade.shares * (current_price - trade.entry_price), 4)
+            unrealized = round(trade.open_shares * (current_price - trade.entry_price), 4)
     shadow = None
     if obs is not None:
         shadow = ShadowExitSummary(
@@ -77,7 +80,8 @@ def _to_entry(trade: PaperTrade, market: Market, snap: MarketSnapshot | None,
         market_id=market.polymarket_market_id, question=market.question,
         direction=trade.direction, entry_price=trade.entry_price,
         entry_time=trade.entry_time, notional=trade.notional, shares=trade.shares,
-        exit_price=trade.exit_price, exit_time=trade.exit_time, pnl=trade.pnl,
+        remaining_shares=trade.open_shares, exit_price=trade.exit_price,
+        exit_time=trade.exit_time, pnl=trade.pnl,
         unrealized_pnl=unrealized, current_price=current_price, price_basis=basis,
         price_as_of=as_of, status=trade.status, source=trade.source,
         exit_reason=trade.exit_reason, shadow=shadow)
@@ -135,7 +139,10 @@ async def list_paper_trades(status: str | None = Query(default=None,
             mark = pick_mark(direction=trade.direction, snapshot=snaps.get(market.id),
                              observation=observations.get(trade.id))
             if mark is not None:
-                summary.total_unrealized_pnl += trade.shares * (mark.price - trade.entry_price)
+                summary.total_unrealized_pnl += (trade.open_shares
+                                                 * (mark.price - trade.entry_price))
+            if trade.pnl is not None:  # realized part of a partially exited position
+                summary.total_realized_pnl += trade.pnl
         elif trade.status == "CLOSED":
             summary.closed_count += 1
             if trade.pnl is not None:
@@ -174,6 +181,9 @@ async def list_observations(paper_trade_id: str,
     cohort = (await db.execute(select(PaperTradeCohortMember).where(
         PaperTradeCohortMember.paper_trade_id == trade.id)
         .order_by(PaperTradeCohortMember.weight.desc()))).scalars().all()
+    exits = (await db.execute(select(PaperTradeExit).where(
+        PaperTradeExit.paper_trade_id == trade.id)
+        .order_by(PaperTradeExit.exit_time))).scalars().all()
     observations = (await db.execute(select(PositionObservation).where(
         PositionObservation.paper_trade_id == trade.id)
         .order_by(PositionObservation.observed_at.desc()).limit(limit))).scalars().all()
@@ -184,7 +194,11 @@ async def list_observations(paper_trade_id: str,
             entry_opposite_shares=m.entry_opposite_shares,
             entry_net_exposure=m.entry_net_exposure, entry_value=m.entry_value,
             weight=m.weight, smart_money_score=m.smart_money_score, label=m.label,
-            source=m.source) for m in cohort],
+            source=m.source, baseline_verified=m.entry_baseline_verified is True)
+            for m in cohort],
+        exits=[PaperTradeExitEntry(
+            exit_time=x.exit_time, shares=x.shares, price=x.price, proceeds=x.proceeds,
+            fee=x.fee, reason=x.reason, pnl=x.pnl) for x in exits],
         observations=[PositionObservationEntry(
             observed_at=o.observed_at, market_status=o.market_status, best_bid=o.best_bid,
             best_ask=o.best_ask, liquidation_price=o.liquidation_price,
@@ -204,8 +218,26 @@ async def close_paper_trade(paper_trade_id: str, body: PaperTradeCloseRequest,
                             db: AsyncSession = Depends(get_db),
                             container: Container = Depends(get_container)
                             ) -> PaperTradeEntry:
-    trade = await container.paper_trades.close(db, paper_trade_id, body.exit_price)
+    """No exit_price → sell into the live bid ladder (net of PAPER_EXIT_FEE_BPS); only the
+    depth the book can absorb is filled, the rest stays OPEN (A24)."""
+    bids = None
+    if body.exit_price is None:
+        row = (await db.execute(select(PaperTrade, Market).join(
+            Market, PaperTrade.market_id == Market.id).where(
+            PaperTrade.trade_uid == paper_trade_id))).first()
+        if row is not None:
+            open_trade, market_row = row
+            token = (market_row.yes_token_id if open_trade.direction == "YES"
+                     else market_row.no_token_id)
+            try:
+                bids = normalize_book(await container.clob.get_book(token), token).bids
+            except UpstreamError:
+                bids = None
+    trade = await container.paper_trades.close(
+        db, paper_trade_id, body.exit_price, bids=bids,
+        fee_bps=container.settings.paper_exit_fee_bps)
     await db.commit()
     market = (await db.execute(select(Market).where(
         Market.id == trade.market_id))).scalar_one()
-    return _to_entry(trade, market, None)
+    snap = (await _latest_prices(db, [market.id])).get(market.id)
+    return _to_entry(trade, market, snap)

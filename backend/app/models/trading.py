@@ -5,6 +5,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     JSON,
+    Boolean,
     DateTime,
     Float,
     ForeignKey,
@@ -87,6 +88,30 @@ class PaperTrade(Base):
     source: Mapped[str] = mapped_column(String(16), default="MANUAL")  # AUTO_SIGNAL / MANUAL
     # MANUAL (user close) / RESOLVED (settled from the official market resolution, A25).
     exit_reason: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # Shares still held after partial exits (A24). NULL on legacy rows: OPEN → all shares.
+    remaining_shares: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    @property
+    def open_shares(self) -> float:
+        if self.remaining_shares is not None:
+            return self.remaining_shares
+        return self.shares if self.status == "OPEN" else 0.0
+
+
+class PaperTradeExit(Base):
+    """One simulated sale (or settlement) of part or all of a paper position (A24).
+    `price` is the average NET proceeds per share after walking the bid ladder and fees."""
+    __tablename__ = "paper_trade_exits"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    paper_trade_id: Mapped[int] = mapped_column(ForeignKey("paper_trades.id"), index=True)
+    exit_time: Mapped[datetime] = mapped_column(DateTime)
+    shares: Mapped[float] = mapped_column(Float)
+    price: Mapped[float] = mapped_column(Float)
+    proceeds: Mapped[float] = mapped_column(Float)  # net USDC
+    fee: Mapped[float] = mapped_column(Float, default=0.0)
+    reason: Mapped[str] = mapped_column(String(16))  # MANUAL / RESOLVED
+    pnl: Mapped[float] = mapped_column(Float)  # proceeds − shares × entry_price
 
 
 class PaperTradeCohortMember(Base):
@@ -102,6 +127,9 @@ class PaperTradeCohortMember(Base):
     entry_opposite_shares: Mapped[float] = mapped_column(Float, default=0.0)  # if seen
     entry_net_exposure: Mapped[float] = mapped_column(Float)  # e_i0 (shares, > 0)
     entry_value: Mapped[float] = mapped_column(Float)  # USDC value of our-side position
+    # False/NULL: the account's full opposite-side holding at entry could not be read, so
+    # e_i0 is unverified and the member is excluded from retention (A26).
+    entry_baseline_verified: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     weight: Mapped[float] = mapped_column(Float)  # w_i, sums to 1 per trade
     smart_money_score: Mapped[float] = mapped_column(Float)
     label: Mapped[str] = mapped_column(String(32))

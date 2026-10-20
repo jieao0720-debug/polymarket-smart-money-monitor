@@ -97,7 +97,8 @@ class PositionMonitorService:
             retention_exit=s.shadow_exit_retention_exit,
             min_coverage=s.shadow_exit_min_coverage,
             confirmations=s.shadow_exit_confirmations,
-            stop_loss_return=s.shadow_exit_stop_loss_return)
+            stop_loss_return=s.shadow_exit_stop_loss_return,
+            min_confirm_interval_minutes=s.shadow_exit_min_confirm_interval_minutes)
 
     @property
     def running(self) -> bool:
@@ -149,14 +150,16 @@ class PositionMonitorService:
             for trade in trades:
                 payout = resolution.payout(trade.direction)
                 assert payout is not None
-                self.paper_trades.settle(trade, payout, settled_at)
+                held = trade.open_shares
+                realized = _realized_proceeds(trade)
+                await self.paper_trades.settle(session, trade, payout, settled_at)
                 result.settled += 1
                 session.add(PositionObservation(
                     paper_trade_id=trade.id, observed_at=now, market_status=MARKET_RESOLVED,
                     best_bid=None, best_ask=None, liquidation_price=payout,
-                    liquidation_value=round(trade.shares * payout, 4),
+                    liquidation_value=round(held * payout, 4),
                     liquidation_fill_ratio=1.0,
-                    liquidation_return=_ret(trade.shares * payout, trade.notional),
+                    liquidation_return=_ret(realized + held * payout, trade.notional),
                     data_issues=market_issues or None))
                 result.observations += 1
             market_row.closed = True
@@ -189,16 +192,16 @@ class PositionMonitorService:
                        latest_signal: SmartMoneySignal | None,
                        positions_cache: dict[str, list | None], now: datetime,
                        issues: list[str]) -> PositionObservation:
-        # --- sell-side valuation (A24)
+        # --- sell-side valuation of what is still held (A24); return includes exits so far
         if book is None:
             issues.append("order book unavailable")
             quote = None
         else:
-            quote = liquidation_quote(book.bids, trade.shares,
+            quote = liquidation_quote(book.bids, trade.open_shares,
                                       self.settings.paper_exit_fee_bps)
             if quote.fill_ratio == 0:
                 issues.append("no bids — position cannot be sold now")
-        liq_return = (_ret(quote.value, trade.notional)
+        liq_return = (_ret(_realized_proceeds(trade) + quote.value, trade.notional)
                       if quote is not None and quote.fill_ratio > 0 else None)
 
         # --- cohort retention (A26)
@@ -221,12 +224,15 @@ class PositionMonitorService:
             positions = positions_cache.get(m.wallet_address)
             current = (None if positions is None
                        else net_exposure(positions, our_token, opp_token))
-            exposures.append(MemberExposure(m.weight, m.entry_net_exposure, current))
+            verified = m.entry_baseline_verified is True
+            exposures.append(MemberExposure(m.weight, m.entry_net_exposure, current, verified))
             detail.append({
                 "wallet": m.wallet_address, "weight": round(m.weight, 6),
                 "entry_net_exposure": m.entry_net_exposure,
                 "current_net_exposure": None if current is None else round(current, 4),
-                "status": ("UNKNOWN" if current is None
+                "baseline_verified": verified,
+                "status": ("UNVERIFIED_BASELINE" if not verified
+                           else "UNKNOWN" if current is None
                            else "REVERSED" if current < 0
                            else "EXITED" if current == 0
                            else "REDUCED" if current < m.entry_net_exposure
@@ -234,22 +240,32 @@ class PositionMonitorService:
         retention, coverage = compute_retention(exposures)
         if members and any(e.current_net_exposure is None for e in exposures):
             issues.append("some cohort positions unavailable — treated as unknown, not 0")
+        if any(not e.baseline_verified for e in exposures):
+            issues.append("some entry baselines unverified — excluded from retention")
 
-        # --- latest scanner signal after entry
-        flipped = False
+        # --- latest scanner signal after entry: evidence only when it is NEW since the
+        # previous observation and FRESH, so one old signal is never re-confirmed (A27)
+        previous = await self.paper_trades.latest_observation(session, trade.id)
+        flipped: bool | None = None
         sig_dir = sig_time = None
         if latest_signal is not None and latest_signal.snapshot_time > trade.entry_time:
             sig_dir, sig_time = latest_signal.direction, latest_signal.snapshot_time
-            flipped = sig_dir in ("YES", "NO") and sig_dir != trade.direction
+            seen = previous.latest_signal_time if previous else None
+            is_new = seen is None or sig_time > seen
+            max_age = self.settings.shadow_exit_signal_max_age_hours * 3600.0
+            is_fresh = (now - sig_time).total_seconds() <= max_age
+            if is_new and is_fresh:
+                flipped = sig_dir in ("YES", "NO") and sig_dir != trade.direction
+            elif is_new:
+                issues.append("latest scanner signal is stale — not used as evidence")
 
         # --- shadow exit rules (A27): recorded only
-        previous = await self.paper_trades.latest_observation(session, trade.id)
         shadow = evaluate_shadow(
             retention=retention, coverage=coverage, liquidation_return=liq_return,
             signal_flipped=flipped,
             previous_state=previous.shadow_state if previous else None,
             previous_target=previous.shadow_target_fraction if previous else None,
-            observed_at_iso=now.isoformat(), thresholds=self.thresholds)
+            observed_at=now, thresholds=self.thresholds)
 
         return PositionObservation(
             paper_trade_id=trade.id, observed_at=now, market_status=market_status,
@@ -298,6 +314,12 @@ class PositionMonitorService:
             return
         positions = [normalize_position(r) for r in raw]
         cache[wallet] = [p for p in positions if p.condition_id == condition_id]
+
+
+def _realized_proceeds(trade: PaperTrade) -> float:
+    """Net proceeds of exits already recorded = realized pnl + exited shares × entry."""
+    exited = trade.shares - trade.open_shares
+    return (trade.pnl or 0.0) + exited * trade.entry_price if exited > 0 else 0.0
 
 
 def _ret(value: float, notional: float) -> float | None:

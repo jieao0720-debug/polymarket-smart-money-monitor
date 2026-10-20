@@ -286,10 +286,11 @@ class PaperTradeEntry(BaseModel):
     entry_time: datetime
     notional: float
     shares: float
-    exit_price: float | None
+    remaining_shares: float | None = None  # still held after partial exits
+    exit_price: float | None  # average net exit price once fully CLOSED
     exit_time: datetime | None
-    pnl: float | None
-    unrealized_pnl: float | None = None
+    pnl: float | None  # realized so far (partial exits included)
+    unrealized_pnl: float | None = None  # remaining_shares × (best bid − entry)
     current_price: float | None = None  # side best bid (A24)
     price_basis: str | None = None  # BID / MIDPOINT (fallback when no bid recorded)
     price_as_of: datetime | None = None
@@ -338,11 +339,23 @@ class CohortMemberEntry(BaseModel):
     smart_money_score: float
     label: str
     source: str
+    baseline_verified: bool
+
+
+class PaperTradeExitEntry(BaseModel):
+    exit_time: datetime
+    shares: float
+    price: float  # average net proceeds per share
+    proceeds: float
+    fee: float
+    reason: str
+    pnl: float
 
 
 class PositionObservationsResponse(BaseModel):
     paper_trade_id: str
     cohort: list[CohortMemberEntry]
+    exits: list[PaperTradeExitEntry]
     observations: list[PositionObservationEntry]
 
 

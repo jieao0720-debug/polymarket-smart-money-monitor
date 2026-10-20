@@ -4,6 +4,7 @@ from app.models.trading import (
     ApiFetchLog,
     PaperTrade,
     PaperTradeCohortMember,
+    PaperTradeExit,
     PositionObservation,
     SmartMoneySignal,
     TradeTicket,
@@ -14,7 +15,8 @@ from app.models.trading import (
 __all__ = [
     "Account", "AccountLabel", "AccountResolvedStats",
     "Market", "MarketHolder", "MarketSnapshot", "utcnow",
-    "ApiFetchLog", "PaperTrade", "PaperTradeCohortMember", "PositionObservation",
+    "ApiFetchLog", "PaperTrade", "PaperTradeCohortMember", "PaperTradeExit",
+    "PositionObservation",
     "SmartMoneySignal", "TradeTicket",
     "WalletConnection", "new_uid",
 ]

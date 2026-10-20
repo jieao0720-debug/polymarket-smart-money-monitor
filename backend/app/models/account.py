@@ -56,3 +56,6 @@ class AccountLabel(Base):
     smart_money_score: Mapped[float] = mapped_column(Float, default=0.0)
     score_breakdown: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     reason: Mapped[str] = mapped_column(String(512), default="")
+    # Side of the holder row this label scores (a wallet can hold both sides, and the
+    # score depends on the position). NULL on rows written before 2026-10-20.
+    direction: Mapped[str | None] = mapped_column(String(8), nullable=True)

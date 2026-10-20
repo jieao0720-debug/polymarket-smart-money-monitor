@@ -99,6 +99,7 @@ SQLAlchemy 2.0；本地 SQLite / 生产 PostgreSQL。所有表带自增整型主
 | entry_notional_approx | float NULL | /positions initialValue（≈开仓成本，命名即口径） |
 | rank | int | 边内按 current_position_value 降序 1..20 |
 | value_is_approx | bool | current_position_value 是否为 shares*price 近似 |
+| opposite_shares | float NULL | 该账户在本市场另一侧的完整持仓份额（/positions）；NULL = 查询失败或旧记录 |
 
 复合索引 `(market_id, snapshot_time)`。
 
@@ -115,6 +116,7 @@ SQLAlchemy 2.0；本地 SQLite / 生产 PostgreSQL。所有表带自增整型主
 | smart_money_score | float | 0–100 |
 | score_breakdown | JSON | 各分项与惩罚明细（透明可审计） |
 | reason | str | 人类可读标签原因 |
+| direction | str NULL | 该标签对应的持仓方向（双边持仓钱包每侧一条）；旧记录为 NULL |
 
 ## 7. smart_money_signals
 
@@ -173,6 +175,22 @@ SQLAlchemy 2.0；本地 SQLite / 生产 PostgreSQL。所有表带自增整型主
 | status | str OPEN/CLOSED/CANCELLED INDEX |
 | source | str AUTO_SIGNAL / MANUAL |
 | exit_reason | str NULL（MANUAL 手动平仓 / RESOLVED 按官方结算入账，A25） |
+| remaining_shares | float NULL（部分平仓后仍持有的份额；NULL 为旧记录：OPEN 视为全部份额） |
+
+`exit_price` 为全部平完后的平均净卖出价；`pnl` 为已实现盈亏，部分平仓时也会累计。
+
+### 9a. paper_trade_exits（模拟成交记录，A24）
+
+| 列 | 类型 |
+| --- | --- |
+| id | int PK |
+| paper_trade_id | FK INDEX |
+| exit_time | datetime |
+| shares | float（本次卖出份额） |
+| price | float（扣费后平均净价） |
+| proceeds / fee | float（净收入 / 手续费） |
+| reason | str MANUAL / RESOLVED |
+| pnl | float（proceeds − shares × entry_price） |
 
 ### 9b. paper_trade_cohort（入场跟随名单，A26）
 
@@ -185,6 +203,7 @@ SQLAlchemy 2.0；本地 SQLite / 生产 PostgreSQL。所有表带自增整型主
 | entry_shares / entry_opposite_shares | float（入场时本方向 / 反方向份额） |
 | entry_net_exposure | float（e_0，> 0） |
 | entry_value | float（入场时本方向持仓价值，权重基数） |
+| entry_baseline_verified | bool NULL（入场反方向持仓是否已核实；false/NULL 不参与保留率） |
 | weight | float（同一仓位合计 1） |
 | smart_money_score / label | 入场时评分与标签 |
 | source | str ENTRY / BACKFILL |
@@ -202,9 +221,9 @@ SQLAlchemy 2.0；本地 SQLite / 生产 PostgreSQL。所有表带自增整型主
 | best_bid / best_ask | float NULL（持有方向） |
 | liquidation_price / liquidation_value / liquidation_fill_ratio / liquidation_return | float NULL（按买盘逐档卖出整笔仓位，扣费；未成交部分不计价值） |
 | retention / coverage | float NULL（R 与已知权重合计） |
-| cohort_detail | JSON（每个账户 e_0、e_t、HOLDING/REDUCED/EXITED/REVERSED/UNKNOWN） |
+| cohort_detail | JSON（每个账户 e_0、e_t、HOLDING/REDUCED/EXITED/REVERSED/UNKNOWN/UNVERIFIED_BASELINE） |
 | latest_signal_direction / latest_signal_time | 入场后最新扫描信号 |
-| shadow_state | JSON（各规则连续计数 streaks、首次触发时间 fired_at） |
+| shadow_state | JSON（各规则连续计数 streaks、最近计数时间 counted_at、首次触发时间 fired_at） |
 | shadow_triggers | JSON NULL（本轮确认的规则） |
 | shadow_target_fraction | float（影子目标仓位比例，只降不升） |
 | data_issues | JSON NULL（数据缺失说明） |
@@ -246,6 +265,7 @@ accounts 1─n account_resolved_stats
 markets 1─n smart_money_signals 1─n paper_trades(逻辑FK signal_uid)
 paper_trades 1─n paper_trade_cohort
 paper_trades 1─n position_observations
+paper_trades 1─n paper_trade_exits
 markets 1─n trade_tickets
 ```
 

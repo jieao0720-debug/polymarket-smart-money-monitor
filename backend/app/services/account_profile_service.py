@@ -122,16 +122,22 @@ class AccountProfileService:
         positions, truncated = await self.get_closed_positions(address)
         return compute_resolved_stats(positions, as_of, history_truncated=truncated)
 
-    async def get_market_position(self, address: str, condition_id: str
-                                  ) -> NormalizedPosition | None:
-        """Current position of `address` in one market (for avg price / value / approx entry)."""
+    async def get_market_positions(self, address: str, condition_id: str
+                                   ) -> list[NormalizedPosition] | None:
+        """All current positions of `address` in one market (both sides).
+        None = lookup failed (unknown); [] = known to hold nothing."""
         try:
             raw = await self.data_client.get_positions(address, condition_id=condition_id,
                                                        limit=10)
         except UpstreamError:
             return None
         positions = [normalize_position(r) for r in raw]
-        positions = [p for p in positions if p.condition_id == condition_id and p.shares > 0]
+        return [p for p in positions if p.condition_id == condition_id and p.shares > 0]
+
+    async def get_market_position(self, address: str, condition_id: str
+                                  ) -> NormalizedPosition | None:
+        """Current position of `address` in one market (for avg price / value / approx entry)."""
+        positions = await self.get_market_positions(address, condition_id)
         if not positions:
             return None
         # An account can hold both sides; keep the larger value side for holder context.

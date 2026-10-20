@@ -89,6 +89,12 @@ class Settings(BaseSettings):
     shadow_exit_confirmations: int = Field(default=2, alias="SHADOW_EXIT_CONFIRMATIONS")
     shadow_exit_stop_loss_return: float = Field(
         default=-0.25, alias="SHADOW_EXIT_STOP_LOSS_RETURN")
+    # Confirmations must be at least this far apart (back-to-back passes count once).
+    shadow_exit_min_confirm_interval_minutes: float = Field(
+        default=30.0, alias="SHADOW_EXIT_MIN_CONFIRM_INTERVAL_MINUTES")
+    # A scanner signal older than this is not evidence for the flip rule.
+    shadow_exit_signal_max_age_hours: float = Field(
+        default=6.0, alias="SHADOW_EXIT_SIGNAL_MAX_AGE_HOURS")
 
     # --- http ---
     http_timeout_seconds: float = Field(default=15.0, alias="HTTP_TIMEOUT_SECONDS")

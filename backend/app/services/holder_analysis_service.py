@@ -29,6 +29,8 @@ class AnalyzedHolder:
     value_is_approx: bool
     rank: int
     stats: ResolvedStats
+    # Full other-side holding from /positions; None = lookup failed (A26).
+    opposite_shares: float | None = None
 
 
 class HolderAnalysisService:
@@ -59,10 +61,14 @@ class HolderAnalysisService:
             except UpstreamError:
                 partial = True
                 return None  # without history we cannot label honestly — drop with warning
-            position = await self.profile_service.get_market_position(
+            positions = await self.profile_service.get_market_positions(
                 row.wallet_address, market.condition_id)
+            # Match this row's token explicitly — a two-sided account has two positions.
+            position = next((p for p in positions or [] if p.token_id == row.token_id), None)
+            opposite_shares = (None if positions is None else
+                               sum(p.shares for p in positions if p.token_id != row.token_id))
             price = side_price.get(row.direction)
-            if position is not None and position.token_id == row.token_id:
+            if position is not None:
                 value = position.current_value
                 avg_price = position.average_price
                 cur_price = position.current_price if position.current_price is not None else price
@@ -71,7 +77,7 @@ class HolderAnalysisService:
                 if value is None:  # UNCERTAINTY-U4 fallback
                     value = row.shares * (cur_price or 0.0)
             else:
-                partial = partial or position is None
+                partial = partial or positions is None
                 avg_price = None
                 cur_price = price
                 entry_approx = None
@@ -91,6 +97,7 @@ class HolderAnalysisService:
                 value_is_approx=value_is_approx,
                 rank=0,
                 stats=stats,
+                opposite_shares=opposite_shares,
             )
 
         enriched = await asyncio.gather(*(enrich(r) for r in holder_rows))

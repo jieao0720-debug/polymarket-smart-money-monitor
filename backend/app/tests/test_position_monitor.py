@@ -166,14 +166,30 @@ class TestRetention:
 
 
 class TestShadowEvaluation:
-    T = ShadowThresholds(confirmations=2)
+    T = ShadowThresholds(confirmations=2, min_confirm_interval_minutes=0)
 
-    def _eval(self, prev=None, prev_target=None, **kw):
+    def _eval(self, prev=None, prev_target=None, at=NOW, thresholds=None, **kw):
         args = dict(retention=1.0, coverage=1.0, liquidation_return=0.0,
                     signal_flipped=False)
         args.update(kw)
         return evaluate_shadow(previous_state=prev, previous_target=prev_target,
-                               observed_at_iso="t", thresholds=self.T, **args)
+                               observed_at=at, thresholds=thresholds or self.T, **args)
+
+    def test_min_interval_between_confirmations(self):
+        spaced = ShadowThresholds(confirmations=2, min_confirm_interval_minutes=30)
+        first = self._eval(retention=0.6, thresholds=spaced)
+        soon = self._eval(prev=first.state, retention=0.6, thresholds=spaced,
+                          at=NOW + timedelta(minutes=5))
+        assert soon.fired == [] and soon.state["streaks"][TRIGGER_COHORT_REDUCE] == 1
+        later = self._eval(prev=soon.state, retention=0.6, thresholds=spaced,
+                           at=NOW + timedelta(minutes=31))
+        assert later.fired == [TRIGGER_COHORT_REDUCE]
+
+    def test_no_new_signal_keeps_flip_streak(self):
+        first = self._eval(signal_flipped=True)
+        gap = self._eval(prev=first.state, signal_flipped=None)
+        assert gap.fired == []
+        assert self._eval(prev=gap.state, signal_flipped=True).fired == ["SIGNAL_FLIP"]
 
     def test_needs_consecutive_confirmation(self):
         first = self._eval(retention=0.6)
@@ -225,6 +241,12 @@ def _observations(client, trade_id):
     return client.get(f"/api/paper-trades/{trade_id}/observations").json()
 
 
+def _two_spaced_passes(client, container):
+    entry = datetime.fromisoformat(_open_trade(client)["entry_time"])
+    _monitor_at(client, container, entry + timedelta(hours=1))
+    _monitor_at(client, container, entry + timedelta(hours=2))
+
+
 class TestPositionMonitorFlow:
     def test_entry_freezes_cohort_and_marks_at_bid(self, app_bundle):
         client, _, _ = app_bundle
@@ -252,13 +274,12 @@ class TestPositionMonitorFlow:
         assert trade["shadow"]["retention"] == 1.0
 
     def test_cohort_reduction_is_shadow_only(self, app_bundle):
-        client, _, dataset = app_bundle
+        client, container, dataset = app_bundle
         run_scan_and_wait(client)
         dataset["positions"][(fakes.ADDR_SMART, "0xc1")] = [fakes.make_position(
             fakes.ADDR_SMART, "0xc1", "111", "Yes", size=5000, avg_price=0.55,
             cur_price=0.60)]
-        _run_monitor(client)
-        _run_monitor(client)
+        _two_spaced_passes(client, container)
         trade = _open_trade(client)
         assert trade["status"] == "OPEN"  # shadow mode never acts
         obs = _observations(client, trade["paper_trade_id"])["observations"]
@@ -270,13 +291,12 @@ class TestPositionMonitorFlow:
         assert trade["shadow"]["triggers"] == [TRIGGER_COHORT_REDUCE]
 
     def test_cohort_exit_and_reversal(self, app_bundle):
-        client, _, dataset = app_bundle
+        client, container, dataset = app_bundle
         run_scan_and_wait(client)
         dataset["positions"][(fakes.ADDR_SMART, "0xc1")] = [fakes.make_position(
             fakes.ADDR_SMART, "0xc1", "222", "No", size=4000, avg_price=0.4,
             cur_price=0.41)]
-        _run_monitor(client)
-        _run_monitor(client)
+        _two_spaced_passes(client, container)
         trade = _open_trade(client)
         obs = _observations(client, trade["paper_trade_id"])["observations"][0]
         assert obs["retention"] == 0.0
@@ -396,3 +416,191 @@ def test_add_missing_nullable_columns_on_legacy_table():
         cols = {c["name"] for c in inspect(conn).get_columns("paper_trades")}
         assert "exit_reason" in cols
         assert add_missing_nullable_columns(conn) == []  # idempotent
+
+
+# ----------------------------------------------------------------- regressions (review 96aa677)
+
+def _monitor_at(client, container, when):
+    from functools import partial
+    return client.portal.call(partial(container.position_monitor.run_once, now=when))
+
+
+def _add_signal(client, container, direction, at):
+    from sqlalchemy import select
+
+    from app.models import Market, SmartMoneySignal
+
+    async def add() -> None:
+        async with container.session_factory() as session:
+            market = (await session.execute(select(Market))).scalars().first()
+            session.add(SmartMoneySignal(
+                market_id=market.id, snapshot_time=at, direction=direction,
+                confidence_score=70.0, yes_smart_money_notional=0.0,
+                no_smart_money_notional=5000.0))
+            await session.commit()
+
+    client.portal.call(add)
+
+
+class TestReviewRegressions:
+    def test_wallet_on_both_sides_still_logs_trade_with_one_member(self, app_bundle):
+        """P1: a wallet in both YES and NO top-20 produced duplicate cohort rows →
+        IntegrityError → the auto paper trade was rolled back."""
+        client, _, dataset = app_bundle
+        dataset["holders"]["0xc1"][1]["holders"].append(
+            {"proxyWallet": fakes.ADDR_SMART, "amount": 2000, "outcomeIndex": 1,
+             "name": "smartwhale", "pseudonym": "Wise-Owl", "displayUsernamePublic": True})
+        dataset["positions"][(fakes.ADDR_SMART, "0xc1")] = [
+            fakes.make_position(fakes.ADDR_SMART, "0xc1", "111", "Yes", size=10000,
+                                avg_price=0.55, cur_price=0.60),
+            fakes.make_position(fakes.ADDR_SMART, "0xc1", "222", "No", size=2000,
+                                avg_price=0.40, cur_price=0.41)]
+        status = run_scan_and_wait(client)
+        assert status["errors"] == []
+        trade = _open_trade(client)
+        cohort = _observations(client, trade["paper_trade_id"])["cohort"]
+        assert len(cohort) == 1
+        assert cohort[0]["entry_shares"] == 10000
+        assert cohort[0]["entry_opposite_shares"] == 2000
+        assert cohort[0]["entry_net_exposure"] == 8000
+
+    def test_unranked_opposite_holding_is_in_entry_baseline(self, app_bundle):
+        """P2: NO 7000 outside the NO top-20 was taken as 0 at entry but counted by the
+        monitor → an untouched account showed R = 30%."""
+        client, _, dataset = app_bundle
+        dataset["positions"][(fakes.ADDR_SMART, "0xc1")] = [
+            fakes.make_position(fakes.ADDR_SMART, "0xc1", "111", "Yes", size=10000,
+                                avg_price=0.55, cur_price=0.60),
+            fakes.make_position(fakes.ADDR_SMART, "0xc1", "222", "No", size=7000,
+                                avg_price=0.40, cur_price=0.41)]
+        run_scan_and_wait(client)
+        trade = _open_trade(client)
+        cohort = _observations(client, trade["paper_trade_id"])["cohort"]
+        assert cohort[0]["entry_net_exposure"] == 3000
+        assert cohort[0]["baseline_verified"] is True
+        _run_monitor(client)
+        obs = _observations(client, trade["paper_trade_id"])["observations"][0]
+        assert obs["retention"] == 1.0
+
+    def test_unverifiable_baseline_is_unknown_not_exit(self, app_bundle):
+        """If the entry position lookup failed, the baseline cannot be verified: the member
+        is excluded from R (lower coverage) instead of producing a fake retention."""
+        client, _, dataset = app_bundle
+        dataset["positions_fail"] = {fakes.ADDR_SMART}
+        run_scan_and_wait(client)
+        dataset["positions_fail"] = set()
+        trade = _open_trade(client)
+        cohort = _observations(client, trade["paper_trade_id"])["cohort"]
+        assert cohort[0]["baseline_verified"] is False
+        _run_monitor(client)
+        obs = _observations(client, trade["paper_trade_id"])["observations"][0]
+        assert obs["retention"] is None and obs["coverage"] == 0.0
+        assert obs["cohort_detail"][0]["status"] == "UNVERIFIED_BASELINE"
+
+    def test_same_stale_flip_signal_is_not_confirmed_twice(self, app_bundle):
+        """P2: one 3-day-old reversal signal was counted again on every pass."""
+        client, container, _ = app_bundle
+        run_scan_and_wait(client)
+        entry = datetime.fromisoformat(_open_trade(client)["entry_time"])
+        _add_signal(client, container, "NO", entry + timedelta(minutes=1))
+        later = entry + timedelta(days=3)
+        _monitor_at(client, container, later)
+        _monitor_at(client, container, later + timedelta(hours=1))
+        trade = _open_trade(client)
+        obs = _observations(client, trade["paper_trade_id"])["observations"][0]
+        assert obs["shadow_target_fraction"] == 1.0
+        assert "SIGNAL_FLIP" not in (obs["shadow_state"]["fired_at"])
+
+    def test_two_distinct_fresh_flip_signals_confirm(self, app_bundle):
+        client, container, _ = app_bundle
+        run_scan_and_wait(client)
+        entry = datetime.fromisoformat(_open_trade(client)["entry_time"])
+        t1 = entry + timedelta(hours=1)
+        _add_signal(client, container, "NO", t1)
+        _monitor_at(client, container, t1 + timedelta(minutes=5))
+        _monitor_at(client, container, t1 + timedelta(minutes=50))  # no new signal
+        t2 = entry + timedelta(hours=2)
+        _add_signal(client, container, "NO", t2)
+        _monitor_at(client, container, t2 + timedelta(minutes=5))
+        trade = _open_trade(client)
+        obs = _observations(client, trade["paper_trade_id"])["observations"]
+        assert obs[1]["shadow_triggers"] is None
+        assert obs[0]["shadow_triggers"] == ["SIGNAL_FLIP"]
+        assert obs[0]["shadow_target_fraction"] == 0.0
+
+    def test_back_to_back_passes_do_not_confirm(self, app_bundle):
+        """Two passes seconds apart are one observation, not two confirmations."""
+        client, container, dataset = app_bundle
+        run_scan_and_wait(client)
+        dataset["positions"][(fakes.ADDR_SMART, "0xc1")] = []
+        entry = datetime.fromisoformat(_open_trade(client)["entry_time"])
+        t = entry + timedelta(hours=1)
+        _monitor_at(client, container, t)
+        _monitor_at(client, container, t + timedelta(seconds=30))
+        obs = _observations(client, _open_trade(client)["paper_trade_id"])["observations"]
+        assert obs[0]["shadow_triggers"] is None
+        _monitor_at(client, container, t + timedelta(minutes=45))
+        obs = _observations(client, _open_trade(client)["paper_trade_id"])["observations"]
+        assert "COHORT_EXIT" in obs[0]["shadow_triggers"]
+
+    def test_manual_close_fills_only_book_depth(self, app_bundle):
+        """P2: a 1-share bid closed a ~163.9-share position in full at the best bid."""
+        client, _, dataset = app_bundle
+        run_scan_and_wait(client)
+        trade = _open_trade(client)
+        dataset["books"]["111"] = {"bids": [{"price": "0.58", "size": "1"}],
+                                   "asks": [{"price": "0.61", "size": "800"}]}
+        closed = client.post(f"/api/paper-trades/{trade['paper_trade_id']}/close",
+                             json={}).json()
+        assert closed["status"] == "OPEN"
+        assert closed["remaining_shares"] == pytest.approx(trade["shares"] - 1, abs=1e-6)
+        assert closed["pnl"] == pytest.approx(1 * (0.58 - 0.61), abs=1e-6)
+        exits = _observations(client, trade["paper_trade_id"])["exits"]
+        assert len(exits) == 1 and exits[0]["shares"] == 1 and exits[0]["price"] == 0.58
+
+    def test_manual_close_refuses_without_bids(self, app_bundle):
+        client, _, dataset = app_bundle
+        run_scan_and_wait(client)
+        trade = _open_trade(client)
+        dataset["books"]["111"] = {"bids": [], "asks": [{"price": "0.61", "size": "800"}]}
+        resp = client.post(f"/api/paper-trades/{trade['paper_trade_id']}/close", json={})
+        assert resp.status_code == 422
+        assert _open_trade(client)["status"] == "OPEN"
+
+    def test_manual_close_applies_fee_and_walks_ladder(self, app_bundle):
+        client, container, dataset = app_bundle
+        container.settings.paper_exit_fee_bps = 100
+        run_scan_and_wait(client)
+        trade = _open_trade(client)
+        shares = trade["shares"]
+        dataset["books"]["111"] = {"bids": [{"price": "0.59", "size": "100"},
+                                            {"price": "0.50", "size": "1000"}],
+                                   "asks": [{"price": "0.61", "size": "800"}]}
+        closed = client.post(f"/api/paper-trades/{trade['paper_trade_id']}/close",
+                             json={}).json()
+        gross = 100 * 0.59 + (shares - 100) * 0.50
+        assert closed["status"] == "CLOSED"
+        assert closed["exit_price"] == pytest.approx(gross * 0.99 / shares, abs=1e-6)
+        assert closed["pnl"] == pytest.approx(gross * 0.99 - trade["notional"], abs=1e-3)
+
+    def test_partial_exit_then_settlement_accounts_both_fills(self, app_bundle):
+        client, _, dataset = app_bundle
+        run_scan_and_wait(client)
+        trade = _open_trade(client)
+        dataset["books"]["111"] = {"bids": [{"price": "0.58", "size": "10"}],
+                                   "asks": [{"price": "0.61", "size": "800"}]}
+        client.post(f"/api/paper-trades/{trade['paper_trade_id']}/close", json={})
+        summary = client.get("/api/paper-trades").json()["summary"]
+        assert summary["total_realized_pnl"] == pytest.approx(10 * (0.58 - 0.61), abs=0.01)
+        dataset["gamma_markets"][0].update(closed=True, outcomePrices=json.dumps(["1", "0"]),
+                                          umaResolutionStatus="resolved")
+        _run_monitor(client)
+        closed = _open_trade(client)
+        rest = trade["shares"] - 10
+        assert closed["status"] == "CLOSED" and closed["exit_reason"] == "RESOLVED"
+        assert closed["pnl"] == pytest.approx(10 * (0.58 - 0.61) + rest * (1 - 0.61),
+                                              abs=1e-3)
+        assert closed["exit_price"] == pytest.approx((10 * 0.58 + rest) / trade["shares"],
+                                                     abs=1e-6)
+        exits = _observations(client, trade["paper_trade_id"])["exits"]
+        assert [x["reason"] for x in exits] == ["MANUAL", "RESOLVED"]

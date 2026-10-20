@@ -26,7 +26,11 @@ export default function PaperTradesPage() {
     setClosing(id);
     setError(null);
     try {
-      await api.closePaperTrade(id); // exit at the latest best bid
+      // Sells into the live bid ladder; only what the book absorbs is filled.
+      const result = await api.closePaperTrade(id);
+      if (result.status === "OPEN" && result.remaining_shares) {
+        setError(t("paper.partialFill", { n: formatNumber(result.remaining_shares) }));
+      }
       await queryClient.invalidateQueries({ queryKey: ["paper-trades"] });
     } catch (e) {
       setError(e instanceof ApiError ? `${e.code}: ${e.message}` : t("paper.closeFailed"));
@@ -113,7 +117,14 @@ export default function PaperTradesPage() {
                     </Td>
                     <Td className="tabular-nums">{formatCents(trade.entry_price)}</Td>
                     <Td className="tabular-nums">{formatUsd(trade.notional, 2)}</Td>
-                    <Td className="tabular-nums">{formatNumber(trade.shares)}</Td>
+                    <Td className="tabular-nums">
+                      {formatNumber(trade.shares)}
+                      {trade.status === "OPEN" && trade.remaining_shares != null && trade.remaining_shares < trade.shares && (
+                        <span className="block text-[10px] text-muted">
+                          {t("paper.remainingOf", { left: formatNumber(trade.remaining_shares), total: formatNumber(trade.shares) })}
+                        </span>
+                      )}
+                    </Td>
                     <Td className="tabular-nums">
                       {trade.status === "CLOSED" ? formatCents(trade.exit_price) : formatCents(trade.current_price)}
                       {trade.status === "OPEN" && trade.price_basis === "MIDPOINT" && (

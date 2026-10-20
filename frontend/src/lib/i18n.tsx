@@ -252,7 +252,9 @@ const en = {
   "paper.emptyHint":
     "No paper trades yet. Run the scanner (qualifying signals auto-log) or log one from a market's trade ticket.",
   "paper.closeFailed": "Failed to close trade",
-  "paper.closeAtBid": "Close @ bid",
+  "paper.closeAtBid": "Sell into bids",
+  "paper.partialFill": "Book absorbed only part of the position — {n} shares still open.",
+  "paper.remainingOf": "{left} of {total} left",
   "paper.thShadow": "Shadow exit",
   "paper.shadowTooltip":
     "Position monitor, shadow mode: what the exit rules WOULD do. Nothing is executed. R = share of the followed smart money's entry position still held.",
@@ -568,7 +570,9 @@ const zh: Record<MessageKey, string> = {
   "paper.closing": "平仓中…",
   "paper.emptyHint": "暂无模拟交易。运行扫描（合格信号会自动入账），或在市场详情的交易票据中手动记录。",
   "paper.closeFailed": "平仓失败",
-  "paper.closeAtBid": "按买一价平仓",
+  "paper.closeAtBid": "按买盘深度平仓",
+  "paper.partialFill": "买盘只承接了部分仓位，仍有 {n} 份未平。",
+  "paper.remainingOf": "剩余 {left} / {total}",
   "paper.thShadow": "影子退出",
   "paper.shadowTooltip":
     "持仓监控（影子模式）：退出规则本会怎么做，不会实际执行。R = 入场跟随的聪明钱仍保留的入场仓位比例。",

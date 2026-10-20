@@ -6,8 +6,9 @@ against the same observations before any rule is allowed to act.
 
 Retention (A26):  R_t = Σ_i w_i · min(1, max(0, e_i,t) / e_i,0)
   e_i,0  account i's net exposure to OUR side at entry, in shares (our − opposite)
-  e_i,t  the same quantity now; unknown (fetch failed) accounts are excluded and the
-         known weight is reported as `coverage` — unknown is never treated as zero.
+  e_i,t  the same quantity now; unknown (fetch failed) accounts, and accounts whose
+         entry baseline could not be verified, are excluded and the known weight is
+         reported as `coverage` — unknown is never treated as zero.
   w_i    frozen at entry ∝ our-side position value, Σ w_i = 1.
 Shares are used, never market value: a price move must not look like an exit.
 """
@@ -84,6 +85,8 @@ class LiquidationQuote:
     price: float | None  # average net proceeds per filled share
     value: float  # net USDC proceeds for the fillable part
     fill_ratio: float
+    filled_shares: float = 0.0
+    fee: float = 0.0
 
 
 def liquidation_quote(bids: list[tuple[float, float]], shares: float,
@@ -102,7 +105,8 @@ def liquidation_quote(bids: list[tuple[float, float]], shares: float,
     if filled <= 0:
         return LiquidationQuote(None, 0.0, 0.0)
     net = gross * (1.0 - fee_bps / 10000.0)
-    return LiquidationQuote(round(net / filled, 6), round(net, 4), round(filled / shares, 6))
+    return LiquidationQuote(round(net / filled, 6), round(net, 4), round(filled / shares, 6),
+                            filled_shares=filled, fee=round(gross - net, 6))
 
 
 def mark_price_from_snapshot(orderbook_depth: dict[str, Any] | None,
@@ -128,6 +132,8 @@ class HolderRecord:
     smart_money_score: float
     label: str
     is_smart_money: bool
+    # Full other-side holding from the account's /positions; None = not read.
+    opposite_shares: float | None = None
 
 
 @dataclass(frozen=True)
@@ -140,31 +146,42 @@ class CohortSeed:
     weight: float
     smart_money_score: float
     label: str
+    baseline_verified: bool
 
 
 def build_cohort(holders: list[HolderRecord], direction: str) -> list[CohortSeed]:
     """Smart-money holders on our side with positive net exposure, weighted by our-side
-    position value (same basis as the signal's direction rule). Opposite shares come
-    from the same snapshot's other-side top-20; absent there they are taken as 0."""
+    position value (same basis as the signal's direction rule).
+
+    Opposite-side shares at entry come from the account's full /positions; if that was
+    not read, from the other side's top-20 row (an exact balance) when the account is
+    there. Otherwise the baseline is UNVERIFIED: it is kept with opposite = 0 for
+    transparency but excluded from retention — a holding outside the other side's top-20
+    must not later look like an exit (A26). One member per wallet."""
     opposite = DIRECTION_NO if direction == DIRECTION_YES else DIRECTION_YES
-    opp_shares = {h.wallet_address: h.shares for h in holders if h.direction == opposite}
-    picked = []
+    opp_rows = {h.wallet_address: h.shares for h in holders if h.direction == opposite}
+    picked: dict[str, tuple[HolderRecord, float, bool]] = {}
     for h in holders:
-        if h.direction != direction or not h.is_smart_money:
+        if h.direction != direction or not h.is_smart_money or h.wallet_address in picked:
             continue
-        opp = opp_shares.get(h.wallet_address, 0.0)
-        net = h.shares - opp
-        if net <= 0 or h.position_value <= 0:
+        if h.opposite_shares is not None:
+            opp, verified = h.opposite_shares, True
+        elif h.wallet_address in opp_rows:
+            opp, verified = opp_rows[h.wallet_address], True
+        else:
+            opp, verified = 0.0, False
+        if h.shares - opp <= 0 or h.position_value <= 0:
             continue
-        picked.append((h, opp, net))
-    total = sum(h.position_value for h, _, _ in picked)
+        picked[h.wallet_address] = (h, opp, verified)
+    total = sum(h.position_value for h, _, _ in picked.values())
     if total <= 0:
         return []
     return [CohortSeed(wallet_address=h.wallet_address, entry_shares=h.shares,
-                       entry_opposite_shares=opp, entry_net_exposure=net,
+                       entry_opposite_shares=opp, entry_net_exposure=h.shares - opp,
                        entry_value=h.position_value, weight=h.position_value / total,
-                       smart_money_score=h.smart_money_score, label=h.label)
-            for h, opp, net in picked]
+                       smart_money_score=h.smart_money_score, label=h.label,
+                       baseline_verified=verified)
+            for h, opp, verified in picked.values()]
 
 
 def net_exposure(positions: list[NormalizedPosition], our_token_id: str,
@@ -181,12 +198,13 @@ class MemberExposure:
     weight: float
     entry_net_exposure: float
     current_net_exposure: float | None  # None = unknown this pass
+    baseline_verified: bool = True
 
 
 def compute_retention(members: list[MemberExposure]) -> tuple[float | None, float]:
     """Returns (R over known members renormalized to their weight, known weight)."""
     known = [m for m in members if m.current_net_exposure is not None
-             and m.entry_net_exposure > 0]
+             and m.baseline_verified and m.entry_net_exposure > 0]
     coverage = sum(m.weight for m in known)
     if coverage <= 0:
         return None, 0.0
@@ -217,25 +235,30 @@ class ShadowThresholds:
     min_coverage: float = 0.70
     confirmations: int = 2
     stop_loss_return: float = -0.25
+    # A streak only advances if this long has passed since it last advanced, so two
+    # passes seconds apart are one observation, not two confirmations.
+    min_confirm_interval_minutes: float = 30.0
 
 
 @dataclass
 class ShadowResult:
-    state: dict[str, Any]  # {"streaks": {trigger: n}, "fired_at": {trigger: iso}}
+    state: dict[str, Any]  # {"streaks", "counted_at", "fired_at"}: {trigger: n / iso}
     fired: list[str] = field(default_factory=list)  # triggers confirmed this pass
     target_fraction: float = 1.0  # sticky min across passes; 1.0 = hold everything
 
 
 def evaluate_shadow(*, retention: float | None, coverage: float,
-                    liquidation_return: float | None, signal_flipped: bool,
+                    liquidation_return: float | None, signal_flipped: bool | None,
                     previous_state: dict[str, Any] | None,
-                    previous_target: float | None, observed_at_iso: str,
+                    previous_target: float | None, observed_at: datetime,
                     thresholds: ShadowThresholds) -> ShadowResult:
     """Consecutive-confirmation shadow evaluation.
 
-    Each candidate condition is True / False / None (None = its data is unavailable this
-    pass: the streak is kept, neither advanced nor reset). A trigger fires once its
-    streak reaches `confirmations`; the target position fraction is the minimum over
+    Each candidate condition is True / False / None. None = no usable evidence this pass
+    (data unavailable, or no NEW scanner signal for the flip rule): the streak is kept,
+    neither advanced nor reset. A True condition advances its streak only when at least
+    `min_confirm_interval_minutes` passed since it last advanced. A trigger fires once
+    its streak reaches `confirmations`; the target position fraction is the minimum over
     fired triggers and never rises again (a reduction is a one-off action — it is not
     undone if the cohort later re-buys)."""
     cohort_known = retention is not None and coverage >= thresholds.min_coverage
@@ -250,17 +273,29 @@ def evaluate_shadow(*, retention: float | None, coverage: float,
     }
     prev = previous_state or {}
     streaks: dict[str, int] = dict(prev.get("streaks") or {})
+    counted_at: dict[str, str] = dict(prev.get("counted_at") or {})
     fired_at: dict[str, str] = dict(prev.get("fired_at") or {})
+    min_gap = thresholds.min_confirm_interval_minutes * 60.0
+    now_iso = observed_at.isoformat()
     fired_now: list[str] = []
     for name, cond in conditions.items():
         if cond is None:
             continue
-        streaks[name] = streaks.get(name, 0) + 1 if cond else 0
+        if not cond:
+            streaks[name] = 0
+            counted_at.pop(name, None)
+            continue
+        last = counted_at.get(name)
+        if (streaks.get(name, 0) == 0 or last is None
+                or (observed_at - datetime.fromisoformat(last)).total_seconds() >= min_gap):
+            streaks[name] = streaks.get(name, 0) + 1
+            counted_at[name] = now_iso
         if streaks[name] >= thresholds.confirmations:
             fired_now.append(name)
-            fired_at.setdefault(name, observed_at_iso)
+            fired_at.setdefault(name, now_iso)
     target = previous_target if previous_target is not None else 1.0
     for name in fired_now:
         target = min(target, TRIGGER_TARGETS[name])
-    return ShadowResult(state={"streaks": streaks, "fired_at": fired_at},
+    return ShadowResult(state={"streaks": streaks, "counted_at": counted_at,
+                               "fired_at": fired_at},
                         fired=fired_now, target_fraction=target)

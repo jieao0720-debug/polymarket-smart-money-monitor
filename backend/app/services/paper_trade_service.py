@@ -1,10 +1,13 @@
 """Paper trading: auto-log qualifying signals, manual entries, close with PnL.
 
-Accounting (api-contract §9): shares = notional / entry_price (frozen at entry);
-pnl = shares * (exit_price - entry_price). Auto entries use the side's best ask at
-signal time (ASSUMPTION-A9) so paper fills are honest taker prices; open positions are
-marked, and by default closed, at the side's best BID (A24) — the price a sale would
-actually get — never the midpoint. Settled markets close at the official payout (A25).
+Accounting (api-contract §9): shares = notional / entry_price (frozen at entry).
+Exits are recorded as paper_trade_exits fills; pnl = Σ fill proceeds − exited shares ×
+entry_price (realized so far), remaining_shares = shares still held, and the trade is
+CLOSED once nothing remains (exit_price = average net exit price). Auto entries use the
+side's best ask at signal time (ASSUMPTION-A9) so paper fills are honest taker prices;
+open positions are marked at the side's best BID, and a default close sells into the
+live bid ladder net of fees — only what the book can absorb is filled (A24). Settled
+markets close at the official payout (A25).
 
 Auto-log guards (ASSUMPTION-A9b): extreme-price signals and signals whose relative
 spread (spread / entry price) exceeds PAPER_TRADE_MAX_RELATIVE_SPREAD are NOT
@@ -21,8 +24,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import NotFoundError, ValidationFailed
-from app.models import Market, MarketSnapshot, PaperTrade, PositionObservation
-from app.services.exit_rules import mark_price_from_snapshot
+from app.models import Market, MarketSnapshot, PaperTrade, PaperTradeExit, PositionObservation
+from app.services.exit_rules import liquidation_quote, mark_price_from_snapshot
 
 EXTREME_PRICE_FLAG = "EXTREME_PRICE"
 
@@ -127,6 +130,7 @@ class PaperTradeService:
             signal_id=signal_uid, market_id=market_row.id, direction=direction,
             entry_price=entry_price, entry_time=entry_time, notional=round(notional, 2),
             shares=round(notional / entry_price, 6), status="OPEN", source="AUTO_SIGNAL")
+        trade.remaining_shares = trade.shares
         session.add(trade)
         await session.flush()
         return trade
@@ -175,44 +179,73 @@ class PaperTradeService:
             signal_id=signal_id, market_id=market_row.id, direction=direction,
             entry_price=entry_price, entry_time=_utcnow(), notional=round(notional, 2),
             shares=round(notional / entry_price, 6), status="OPEN", source="MANUAL")
+        trade.remaining_shares = trade.shares
         session.add(trade)
         await session.flush()
         return trade
 
-    async def close(self, session: AsyncSession, trade_uid: str,
-                    exit_price: float | None) -> PaperTrade:
+    async def close(self, session: AsyncSession, trade_uid: str, exit_price: float | None,
+                    *, bids: list[tuple[float, float]] | None = None,
+                    fee_bps: float = 0.0) -> PaperTrade:
+        """exit_price given → the user asserts a fill: everything remaining exits at it.
+        Otherwise sell the remaining shares into `bids` (the live ladder, best first) net of
+        fees; only what the book absorbs is filled and the rest stays OPEN. No book or no
+        bids → refused: a fill that cannot be verified is never recorded."""
         trade = (await session.execute(select(PaperTrade).where(
             PaperTrade.trade_uid == trade_uid))).scalar_one_or_none()
         if trade is None:
             raise NotFoundError(f"paper trade {trade_uid} not found")
         if trade.status != "OPEN":
             raise ValidationFailed(f"paper trade is {trade.status}, only OPEN can be closed")
-        if exit_price is None:
-            mark = await self.latest_mark(session, trade)
-            exit_price = mark.price if mark is not None else None
-        if exit_price is None:
+        remaining = trade.open_shares
+        now = _utcnow()
+        if exit_price is not None:
+            if not (0 <= exit_price <= 1):
+                raise ValidationFailed("exit_price must be within [0, 1]")
+            await self.record_exit(session, trade, shares=remaining, price=exit_price,
+                                    at=now, reason=EXIT_REASON_MANUAL)
+            return trade
+        if bids is None:
             raise ValidationFailed(
-                "exit_price not provided and no snapshot price available for this market")
-        if not (0 <= exit_price <= 1):
-            raise ValidationFailed("exit_price must be within [0, 1]")
-        self._finalize(trade, exit_price, _utcnow(), EXIT_REASON_MANUAL)
-        await session.flush()
+                "order book unavailable — cannot verify a fill; pass exit_price to force")
+        quote = liquidation_quote(bids, remaining, fee_bps)
+        if quote.price is None or quote.filled_shares <= 0:
+            raise ValidationFailed("no bids in the order book — nothing can be sold now")
+        await self.record_exit(session, trade, shares=quote.filled_shares, price=quote.price,
+                               at=now, reason=EXIT_REASON_MANUAL, fee=quote.fee)
         return trade
 
-    def settle(self, trade: PaperTrade, payout: float, settled_at: datetime) -> PaperTrade:
-        """Close an OPEN trade at the official resolution payout (A25). Idempotent."""
+    async def settle(self, session: AsyncSession, trade: PaperTrade, payout: float,
+                     settled_at: datetime) -> PaperTrade:
+        """Close what remains of an OPEN trade at the official payout (A25). Idempotent."""
         if trade.status != "OPEN":
             return trade
         if not (0 <= payout <= 1):
             raise ValidationFailed("settlement payout must be within [0, 1]")
-        self._finalize(trade, payout, settled_at, EXIT_REASON_RESOLVED)
+        await self.record_exit(session, trade, shares=trade.open_shares, price=payout,
+                               at=settled_at, reason=EXIT_REASON_RESOLVED)
         return trade
 
-    @staticmethod
-    def _finalize(trade: PaperTrade, exit_price: float, exit_time: datetime,
-                  reason: str) -> None:
-        trade.exit_price = exit_price
-        trade.exit_time = exit_time
-        trade.pnl = round(trade.shares * (exit_price - trade.entry_price), 4)
-        trade.status = "CLOSED"
-        trade.exit_reason = reason
+    async def record_exit(self, session: AsyncSession, trade: PaperTrade, *, shares: float,
+                          price: float, at: datetime, reason: str,
+                          fee: float = 0.0) -> PaperTradeExit:
+        remaining = trade.open_shares
+        shares = min(shares, remaining)
+        proceeds = shares * price
+        fill = PaperTradeExit(
+            paper_trade_id=trade.id, exit_time=at, shares=round(shares, 6),
+            price=round(price, 6), proceeds=round(proceeds, 6), fee=round(fee, 6),
+            reason=reason, pnl=round(proceeds - shares * trade.entry_price, 6))
+        session.add(fill)
+        left = remaining - shares
+        trade.remaining_shares = 0.0 if left <= 1e-9 else round(left, 6)
+        trade.pnl = round((trade.pnl or 0.0) + proceeds - shares * trade.entry_price, 4)
+        if trade.remaining_shares == 0.0:
+            exited = trade.shares
+            total_proceeds = trade.pnl + exited * trade.entry_price
+            trade.exit_price = round(total_proceeds / exited, 6) if exited > 0 else price
+            trade.exit_time = at
+            trade.exit_reason = reason
+            trade.status = "CLOSED"
+        await session.flush()
+        return fill

@@ -17,7 +17,7 @@ from app.api.deps import Container  # noqa: E402
 from app.core.config import get_settings  # noqa: E402
 from app.core.logging_utils import configure_logging  # noqa: E402
 from app.db.init_db import init_db  # noqa: E402
-from app.db.session import get_session_factory  # noqa: E402
+from app.db.session import get_engine, get_session_factory  # noqa: E402
 
 
 async def main(max_markets: int | None) -> int:
@@ -39,6 +39,7 @@ async def main(max_markets: int | None) -> int:
         return 0 if state.status == "completed" else 1
     finally:
         await container.aclose()
+        await get_engine().dispose()
 
 
 if __name__ == "__main__":

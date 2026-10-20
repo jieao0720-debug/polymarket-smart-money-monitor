@@ -168,7 +168,8 @@ Body: `{ "wallet_address": "0x..", "manual_confirmation": true }`。
 ```json
 { "paper_trade_id": "s", "signal_id": "s|null", "market_id": "s", "question": "s",
   "direction": "YES", "entry_price": 0.62, "entry_time": "dt", "notional": 50,
-  "shares": 80.6452, "exit_price": null, "exit_time": null, "pnl": null,
+  "shares": 80.6452, "remaining_shares": 80.6452, "exit_price": null, "exit_time": null,
+  "pnl": null,
   "unrealized_pnl": 1.2, "current_price": 0.635, "price_basis": "BID",
   "price_as_of": "dt", "status": "OPEN", "source": "MANUAL", "exit_reason": null,
   "shadow": { "observed_at": "dt", "market_status": "OPEN", "retention": 0.82,
@@ -176,7 +177,8 @@ Body: `{ "wallet_address": "0x..", "manual_confirmation": true }`。
 ```
 
 口径：`shares = notional / entry_price`；`pnl = shares * (exit_price - entry_price)`；
-`unrealized_pnl = shares * (current_price - entry_price)`（仅 OPEN 且有最新价时返回，可为 null）。
+`unrealized_pnl = remaining_shares * (current_price - entry_price)`（仅 OPEN 且有最新价时返回，可为 null）。
+`pnl` 为已实现盈亏，部分平仓后 OPEN 仓位也会有值；`exit_price` 在全部平完后为平均净卖出价。
 `current_price` 为持有方向**买一价**（A24），`price_basis=MIDPOINT` 表示没有买一价记录、退回了中间价。
 `exit_reason`：MANUAL / RESOLVED。`shadow` 为最新一次持仓监控的影子退出结果（A27，只记录，不执行），
 `triggers` 是已触发过的规则（COHORT_REDUCE / COHORT_EXIT / SIGNAL_FLIP / STOP_LOSS）；未监控过为 null。
@@ -193,7 +195,9 @@ Query：`status` `market_id` `limit` `offset`。
 
 ### 10b. POST /api/paper-trades/{id}/close
 
-Body: `{ "exit_price": 0.8 }`（缺省 → 最新买一价，A24）。Response：更新后的 PaperTrade（status CLOSED，`exit_reason=MANUAL`，含 pnl）。
+Body: `{ "exit_price": 0.8 }`。缺省时读取实时盘口，把剩余份额逐档卖给买盘并扣 `PAPER_EXIT_FEE_BPS`（A24）：
+买盘承接不了的份额保持 OPEN（`remaining_shares` > 0）；拿不到盘口或没有买盘返回 422，不记录成交。
+指定 `exit_price` 视为用户声明的成交，按该价格平掉全部剩余份额。Response：更新后的 PaperTrade。
 
 ### 10c. POST /api/paper-trades/monitor/run
 
@@ -213,14 +217,19 @@ Query：`limit`（默认 200）。返回入场跟随名单与观察记录（新�
 { "paper_trade_id": "s",
   "cohort": [ { "wallet_address": "0x..", "entry_shares": 10000, "entry_opposite_shares": 0,
     "entry_net_exposure": 10000, "entry_value": 6000, "weight": 1.0,
-    "smart_money_score": 78.5, "label": "HIGH_WIN_RATE", "source": "ENTRY" } ],
+    "smart_money_score": 78.5, "label": "HIGH_WIN_RATE", "source": "ENTRY",
+    "baseline_verified": true } ],
+  "exits": [ { "exit_time": "dt", "shares": 10, "price": 0.58, "proceeds": 5.8, "fee": 0,
+    "reason": "MANUAL", "pnl": -0.3 } ],
   "observations": [ { "observed_at": "dt", "market_status": "OPEN", "best_bid": 0.59,
     "best_ask": 0.61, "liquidation_price": 0.59, "liquidation_value": 96.7,
     "liquidation_fill_ratio": 1.0, "liquidation_return": -0.033, "retention": 0.5,
     "coverage": 1.0, "cohort_detail": [ { "wallet": "0x..", "weight": 1.0,
-      "entry_net_exposure": 10000, "current_net_exposure": 5000, "status": "REDUCED" } ],
+      "entry_net_exposure": 10000, "current_net_exposure": 5000, "baseline_verified": true,
+      "status": "REDUCED" } ],
     "latest_signal_direction": "YES", "latest_signal_time": "dt",
-    "shadow_state": { "streaks": { "COHORT_REDUCE": 2 }, "fired_at": { "COHORT_REDUCE": "dt" } },
+    "shadow_state": { "streaks": { "COHORT_REDUCE": 2 }, "counted_at": { "COHORT_REDUCE": "dt" },
+      "fired_at": { "COHORT_REDUCE": "dt" } },
     "shadow_triggers": ["COHORT_REDUCE"], "shadow_target_fraction": 0.5,
     "data_issues": null } ] }
 ```
