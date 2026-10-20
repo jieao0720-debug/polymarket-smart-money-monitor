@@ -35,6 +35,7 @@ from app.services.exit_rules import (
     compute_retention,
     evaluate_shadow,
     liquidation_quote,
+    member_status,
     resolve_market,
 )
 from app.services.normalization import normalize_market
@@ -175,6 +176,19 @@ class TestRetention:
 
     def test_all_unknown(self):
         assert compute_retention([MemberExposure(1.0, 10, None)]) == (None, 0.0)
+
+    def test_positions_rounding_is_not_a_reduction(self):
+        # Live data: /holders 143106.561891, /positions rounded to 143106.5618.
+        assert member_status(143106.561891, 143106.5618, True) == "HOLDING"
+        r, _ = compute_retention([MemberExposure(1.0, 143106.561891, 143106.5618)])
+        assert r == 1.0
+
+    def test_member_status_classes(self):
+        assert member_status(100, 99, True) == "REDUCED"
+        assert member_status(100, 0.004, True) == "EXITED"
+        assert member_status(100, -5, True) == "REVERSED"
+        assert member_status(100, None, True) == "UNKNOWN"
+        assert member_status(100, 100, False) == "UNVERIFIED_BASELINE"
 
 
 class TestShadowEvaluation:

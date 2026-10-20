@@ -193,6 +193,34 @@ def net_exposure(positions: list[NormalizedPosition], our_token_id: str,
     return ours - theirs
 
 
+# Data-API /positions reports shares to 4 decimals while /holders carries more, so an
+# untouched wallet can read a hair below its entry baseline. A move this small is
+# rounding, not trading (observed live 2026-10-20: 143106.561891 → 143106.5618).
+EXPOSURE_TOLERANCE_SHARES = 0.01
+
+
+def kept_fraction(entry_net_exposure: float, current_net_exposure: float) -> float:
+    """Share of the entry exposure still held, in [0, 1]."""
+    if current_net_exposure >= entry_net_exposure - EXPOSURE_TOLERANCE_SHARES:
+        return 1.0
+    return max(0.0, current_net_exposure) / entry_net_exposure
+
+
+def member_status(entry_net_exposure: float, current_net_exposure: float | None,
+                  baseline_verified: bool) -> str:
+    if not baseline_verified:
+        return "UNVERIFIED_BASELINE"
+    if current_net_exposure is None:
+        return "UNKNOWN"
+    if current_net_exposure < -EXPOSURE_TOLERANCE_SHARES:
+        return "REVERSED"
+    if current_net_exposure <= EXPOSURE_TOLERANCE_SHARES:
+        return "EXITED"
+    if kept_fraction(entry_net_exposure, current_net_exposure) < 1.0:
+        return "REDUCED"
+    return "HOLDING"
+
+
 @dataclass(frozen=True)
 class MemberExposure:
     weight: float
@@ -208,8 +236,8 @@ def compute_retention(members: list[MemberExposure]) -> tuple[float | None, floa
     coverage = sum(m.weight for m in known)
     if coverage <= 0:
         return None, 0.0
-    kept = sum(m.weight * min(1.0, max(0.0, m.current_net_exposure or 0.0)
-                              / m.entry_net_exposure) for m in known)
+    kept = sum(m.weight * kept_fraction(m.entry_net_exposure, m.current_net_exposure or 0.0)
+               for m in known)
     return round(kept / coverage, 6), round(coverage, 6)
 
 

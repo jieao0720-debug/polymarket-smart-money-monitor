@@ -45,6 +45,7 @@ from app.services.exit_rules import (
     compute_retention,
     evaluate_shadow,
     liquidation_quote,
+    member_status,
     net_exposure,
     resolve_market,
 )
@@ -247,12 +248,7 @@ class PositionMonitorService:
                 "entry_net_exposure": m.entry_net_exposure,
                 "current_net_exposure": None if current is None else round(current, 4),
                 "baseline_verified": verified,
-                "status": ("UNVERIFIED_BASELINE" if not verified
-                           else "UNKNOWN" if current is None
-                           else "REVERSED" if current < 0
-                           else "EXITED" if current == 0
-                           else "REDUCED" if current < m.entry_net_exposure
-                           else "HOLDING")})
+                "status": member_status(m.entry_net_exposure, current, verified)})
         retention, coverage = compute_retention(exposures)
         if members and any(e.current_net_exposure is None for e in exposures):
             issues.append("some cohort positions unavailable — treated as unknown, not 0")
